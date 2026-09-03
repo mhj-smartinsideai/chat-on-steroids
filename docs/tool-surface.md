@@ -172,6 +172,42 @@ ChatGPT, or recreate it if your workspace requires that, then start a new conver
 connector's exposed tool shape changes. The current extension pairs automatically with the local
 bridge; there is no pairing code to enter.
 
+### ChatGPT Desktop Full Mode
+
+The Planner follow-up also serves a local WebMCP page at
+`http://127.0.0.1:8771/full`. Its page-level registration is an adapter over the same Core and
+Desktop registrations described above: names, descriptions and Zod-derived input schemas are
+projected into WebMCP, while invocation returns through `kernel.ts` dispatch and the existing
+handlers. It does not reuse or expose a tokenized MCP connector URL.
+
+The Full page freezes its exposed tool snapshot for that page lifetime. Permission changes are
+therefore reflected in a deliberate page reload, while the live capability guard runs for every
+call. `/planner` has its own four-tool registration and does not accept Full tool names.
+
+The page is informationally explicit about the two desktop-wide risks: `exec_command` starts
+in an approved folder but is not confined there and runs with the logged-in user's privileges;
+Desktop screen/input/clipboard capabilities are not project-root-scoped. Image and screenshot
+content is preserved as MCP content blocks through the backend adapter, but end-to-end rendering
+in a particular ChatGPT Desktop build remains an environment-dependent compatibility check.
+
+### Browser Extension Full Relay
+
+The companion Chrome extension has a separate opt-in Full Relay for assistant-authored
+`<local_tool>` blocks with `"mode":"full"`. It uses the existing authenticated loopback bridge
+at `/full/relay`; it is not the Desktop WebMCP `/full` page and it does not add an MCP surface.
+
+Full Relay is disabled by default and, when enabled, is bound to one explicitly selected approved
+folder. The extension considers only complete blocks in a finished assistant response. User
+messages, fenced examples, malformed blocks and `<local_tool_result>` blocks are inert. The app
+revalidates the request, invokes the existing Core registrations and live permission checks, and
+returns a bounded result through the existing composer submission path.
+
+The initial allowlist is `list_directory`, `read_file`, `search_files`, `write_file`,
+`apply_patch`, `exec_command` and `write_stdin`. Relative paths are resolved below the selected
+root. Shell commands begin there but retain the logged-in user's normal privileges, so the
+approved folder is not a shell sandbox. Relay request ids are deduplicated per conversation and
+each conversation is capped at 100 operations.
+
 ## Tests that protect the surface
 
 `test/mcp.test.ts` checks exact surface membership, cross-surface rejection, discovery-size

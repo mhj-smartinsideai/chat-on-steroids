@@ -1392,6 +1392,8 @@ var CLF_DOM = (() => {
         let done = false;
         let observer = null;
         let timer = null;
+        let fallbackAttempted = false;
+        let submittedButton = null;
         const finish = (value) => {
           if (done) return;
           done = true;
@@ -1399,7 +1401,33 @@ var CLF_DOM = (() => {
           if (timer !== null) clearTimeout(timer);
           resolve(value);
         };
+        const attemptSubmit = () => {
+          if (done) return;
+          const current = composer();
+          if (!current) return;
+          const button = document.querySelector(SEND);
+          if (button && !button.disabled && button.getAttribute('aria-disabled') !== 'true') {
+            // ChatGPT can repaint the send button while the previous click is still settling.
+            // Do not click the same page-owned control twice unless it was replaced.
+            if (button === submittedButton) return;
+            submittedButton = button;
+            button.click();
+            return;
+          }
+          if (fallbackAttempted) return;
+          fallbackAttempted = true;
+          const key = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
+          current.dispatchEvent(new KeyboardEvent('keydown', key));
+          current.dispatchEvent(new KeyboardEvent('keyup', key));
+        };
         const check = () => {
+          if (accepted()) {
+            finish(true);
+            return;
+          }
+          // The input event can make React enable the send button synchronously or on the
+          // following mutation. Re-check here so both paths submit without a fixed delay.
+          attemptSubmit();
           if (accepted()) finish(true);
         };
 
@@ -1413,14 +1441,7 @@ var CLF_DOM = (() => {
         timer = setTimeout(() => finish(false), 3000);
 
         try {
-          const button = document.querySelector(SEND);
-          if (button && !button.disabled) {
-            button.click();
-          } else {
-            const key = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
-            box.dispatchEvent(new KeyboardEvent('keydown', key));
-            box.dispatchEvent(new KeyboardEvent('keyup', key));
-          }
+          attemptSubmit();
           // Close the race where the acceptance mutation happens synchronously inside the
           // click/keyboard handler before MutationObserver gets its microtask callback.
           check();

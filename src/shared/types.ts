@@ -213,6 +213,17 @@ export interface MultiAgentSettings {
   maxWorkers: number;
 }
 
+/**
+ * Browser-side Full Relay. This is deliberately separate from Planner Relay and from the
+ * model-visible MCP surfaces: enabling it lets an assistant message request a local operation
+ * through the paired extension, but it does not add tools to ChatGPT's MCP schema.
+ */
+export interface FullRelaySettings {
+  enabled: boolean;
+  /** Configured approved-root name used as the only Full Relay filesystem boundary. */
+  rootName: string;
+}
+
 export interface Config {
   roots: Root[];
   capabilities: Capabilities;
@@ -222,6 +233,7 @@ export interface Config {
   sessions: SessionSettings;
   compaction: CompactionSettings;
   multiAgent: MultiAgentSettings;
+  fullRelay: FullRelaySettings;
   goal: GoalSettings;
 }
 

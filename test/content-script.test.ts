@@ -120,6 +120,16 @@ interface Hook {
   injectControl(): void;
   injectStage(): void;
   pullActivity(): Promise<void>;
+  parseLocalToolBlock(value: string): Record<string, unknown> | null;
+  extractLocalToolRequests(value: string): Array<Record<string, unknown>>;
+  plannerResultEnvelope(value: Record<string, unknown>): string;
+  queueLocalToolRequests(value: string, conversationId: string, epoch: number): void;
+  parseFullLocalToolBlock(value: string): Record<string, unknown> | null;
+  extractFullLocalToolRequests(value: string): Array<Record<string, unknown>>;
+  queueFullLocalToolRequests(value: string, conversationId: string, epoch: number): void;
+  plannerRelayState(): { conversationId: string | null; epoch: number };
+  drainLocalToolQueue(): Promise<void>;
+  drainFullLocalToolQueue(): Promise<void>;
   runCommand(): Promise<void>;
   startCompact(): Promise<void>;
   chronological<T extends { seq: number; time: number; kind: string; turnId?: string | null }>(entries: T[]): T[];
@@ -10735,5 +10745,252 @@ describe('the goal loop', () => {
       expect(view.objective.summary.endsWith('…')).toBe(true);
       expect(view.objective.summary).not.toMatch(/\s…$/);
     });
+  });
+});
+
+describe('Planner Relay page protocol', () => {
+  const CHAT = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+
+  it('parses only complete supported local_tool blocks', async () => {
+    live = await harness(`https://chatgpt.com/c/${CHAT}`);
+    expect(live.hook.parseLocalToolBlock('{"id":"req-1","tool":"read_file","path":"orca_loop/machine.py"}')).toEqual({
+      id: 'req-1',
+      tool: 'read_file',
+      path: 'orca_loop/machine.py'
+    });
+    expect(live.hook.parseLocalToolBlock('{"id":"req-1","tool":"exec_command","path":"."}')).toBeNull();
+    expect(live.hook.parseLocalToolBlock('{"id":"req-1","tool":"read_file","path":"../../outside"}')).toBeNull();
+    expect(live.hook.extractLocalToolRequests(
+      '<local_tool>{"id":"req-1","tool":"list_directory","path":"orca_loop"}</local_tool>'
+    )).toEqual([{ id: 'req-1', tool: 'list_directory', path: 'orca_loop' }]);
+    expect(live.hook.extractLocalToolRequests(
+      '```xml\n<local_tool>{"id":"req-code","tool":"list_directory","path":"orca_loop"}</local_tool>\n```'
+    )).toEqual([]);
+    expect(live.hook.extractLocalToolRequests('<local_tool>{"id":"incomplete"}')).toEqual([]);
+    expect(live.hook.extractLocalToolRequests(
+      '<local_tool_result>{"id":"req-1","tool":"read_file","ok":true}</local_tool_result>'
+    )).toEqual([]);
+  });
+
+  it('relays one request id and submits one result without overwriting the composer', async () => {
+    const requests: Record<string, unknown>[] = [];
+    let sends = 0;
+    live = await harness(
+      `https://chatgpt.com/c/${CHAT}`,
+      {
+        planner_relay: (message) => {
+          requests.push(message);
+          return { id: message.id, tool: message.tool, ok: true, path: message.path, entries: [] };
+        }
+      },
+      (document) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          sends += 1;
+          document.querySelector('#prompt-textarea')!.replaceChildren();
+        });
+      }
+    );
+    live.hook.observe();
+    await settle();
+
+    const block = '<local_tool>{"id":"req-1","tool":"list_directory","path":"orca_loop"}</local_tool>';
+    const state = live.hook.plannerRelayState();
+    expect(state.conversationId).toBe(CHAT);
+    live.hook.queueLocalToolRequests(block, state.conversationId!, state.epoch);
+    live.hook.queueLocalToolRequests(block, state.conversationId!, state.epoch);
+    await live.hook.drainLocalToolQueue();
+    await settle();
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ type: 'planner_relay', id: 'req-1', tool: 'list_directory', path: 'orca_loop' });
+    expect(sends).toBe(1);
+    expect(composerText(live.document)).toBe('');
+  });
+});
+
+describe('Full Relay page protocol', () => {
+  const CHAT = 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff';
+
+  it('requires mode full and keeps examples and result blocks inert', async () => {
+    live = await harness(`https://chatgpt.com/c/${CHAT}`);
+    expect(live.hook.parseFullLocalToolBlock(
+      '{"id":"full-1","mode":"full","tool":"read_file","path":"src/main.ts"}'
+    )).toEqual({ id: 'full-1', mode: 'full', tool: 'read_file', path: 'src/main.ts' });
+    expect(live.hook.parseFullLocalToolBlock(
+      '{"id":"full-1","tool":"read_file","path":"src/main.ts"}'
+    )).toBeNull();
+    expect(live.hook.parseFullLocalToolBlock(
+      '{"id":"full-1","mode":"full","tool":"read_file","path":"..\\secret"}'
+    )).toBeNull();
+    expect(live.hook.parseFullLocalToolBlock(
+      '{"id":"full-1","mode":"full","tool":"write_plan","path":"plan.md","content":"x"}'
+    )).toBeNull();
+    expect(live.hook.parseFullLocalToolBlock(
+      '{"id":"full-exec","mode":"full","tool":"exec_command","command":["node","-e","console.log(1)"],"cwd":".","timeout_ms":30000}'
+    )).toMatchObject({ id: 'full-exec', mode: 'full', tool: 'exec_command', command: ['node', '-e', 'console.log(1)'], cwd: '', timeout_ms: 30000 });
+    expect(live.hook.extractFullLocalToolRequests(
+      '```xml\n<local_tool>{"id":"full-code","mode":"full","tool":"read_file","path":"src/main.ts"}</local_tool>\n```'
+    )).toEqual([]);
+    expect(live.hook.extractFullLocalToolRequests(
+      '<local_tool_result>{"id":"full-1","mode":"full","tool":"read_file","ok":true}</local_tool_result>'
+    )).toEqual([]);
+  });
+
+  it('relays one full request and submits a mode-preserving result', async () => {
+    const requests: Record<string, unknown>[] = [];
+    let sends = 0;
+    live = await harness(
+      `https://chatgpt.com/c/${CHAT}`,
+      {
+        full_relay: (message) => {
+          requests.push(message);
+          return { id: message.id, mode: 'full', tool: message.tool, ok: true, result: { text: 'ok' } };
+        }
+      },
+      (document) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          sends += 1;
+          document.querySelector('#prompt-textarea')!.replaceChildren();
+        });
+      }
+    );
+    live.hook.observe();
+    await settle();
+
+    const block = '<local_tool>{"id":"full-1","mode":"full","tool":"list_directory","path":"src"}</local_tool>';
+    const state = live.hook.plannerRelayState();
+    live.hook.queueFullLocalToolRequests(block, state.conversationId!, state.epoch);
+    live.hook.queueFullLocalToolRequests(block, state.conversationId!, state.epoch);
+    await live.hook.drainFullLocalToolQueue();
+    await settle();
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ type: 'full_relay', id: 'full-1', mode: 'full', tool: 'list_directory', path: 'src' });
+    expect(sends).toBe(1);
+    expect(composerText(live.document)).toBe('');
+  });
+
+  it('retries submission when the page enables Send after the result is inserted', async () => {
+    const requests: Record<string, unknown>[] = [];
+    let sends = 0;
+    let fallbackEnters = 0;
+    live = await harness(
+      `https://chatgpt.com/c/${CHAT}`,
+      {
+        full_relay: (message) => {
+          requests.push(message);
+          return { id: message.id, mode: 'full', tool: message.tool, ok: true, result: { entries: [] } };
+        }
+      },
+      (document) => {
+        const button = document.querySelector('[data-testid="send-button"]') as HTMLButtonElement;
+        button.disabled = true;
+        const box = document.querySelector('#prompt-textarea')!;
+        box.addEventListener('keydown', (event) => {
+          if ((event as KeyboardEvent).key !== 'Enter') return;
+          fallbackEnters += 1;
+          // Model the page enabling Send after it observes the inserted composer input.
+          button.disabled = false;
+        });
+        button.addEventListener('click', () => {
+          sends += 1;
+          box.replaceChildren();
+        });
+      }
+    );
+    live.hook.observe();
+    await settle();
+
+    const state = live.hook.plannerRelayState();
+    live.hook.queueFullLocalToolRequests(
+      '<local_tool>{"id":"full-send-retry","mode":"full","tool":"list_directory","path":""}</local_tool>',
+      state.conversationId!,
+      state.epoch
+    );
+    await live.hook.drainFullLocalToolQueue();
+    await settle();
+
+    expect(requests).toHaveLength(1);
+    expect(fallbackEnters).toBe(1);
+    expect(sends).toBe(1);
+    expect(composerText(live.document)).toBe('');
+  });
+
+  it('latches final ownership while generating and resumes after the live owner is released', async () => {
+    const requests: Record<string, unknown>[] = [];
+    let sends = 0;
+    live = await harness(
+      `https://chatgpt.com/c/${CHAT}`,
+      {
+        full_relay: (message) => {
+          requests.push(message);
+          return { id: message.id, mode: 'full', tool: message.tool, ok: true, result: { entries: [] } };
+        }
+      },
+      (document) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          sends += 1;
+          document.querySelector('#prompt-textarea')!.replaceChildren();
+        });
+      }
+    );
+    const block = '<local_tool>{"id":"full-race-1","mode":"full","tool":"list_directory","path":""}</local_tool>';
+    const section = assistantTurn(live.document, 'turn-full-race', []);
+    section.setAttribute('data-clf-fiber-turn', '0');
+    startGenerating(live.document);
+    live.hook.observe();
+    await settle();
+    const opened = emitted(live.sent, 'turn_start')[0]!.event.turnId as string;
+    const descriptor = {
+      index: 0,
+      turnId: 'turn-full-race',
+      conversationId: CHAT,
+      endMessageId: 'message-full-race',
+      calls: [],
+      messages: [{
+        messageId: 'message-full-race',
+        rawMessageId: 'message-full-race',
+        stable: true,
+        rawText: block,
+        renderedHtml: '<p>full relay request</p>'
+      }],
+      activities: []
+    };
+
+    // The final message is visible while the local generation is still marked busy. This
+    // must latch ownership without dispatching yet.
+    await replyFiber([], [descriptor]);
+    await settle();
+    await live.hook.flush();
+    await settle();
+    expect(requests).toHaveLength(0);
+    expect(emitted(live.sent, 'assistant_message').at(-1)!.event).toMatchObject({
+      messageId: 'message-full-race',
+      turnId: opened,
+      final: true
+    });
+
+    // The next scan sees the same final message after generation/ownership cleanup. The
+    // latched candidate, rather than the released active owner, authorizes the dispatch.
+    stopGenerating(live.document);
+    await replyFiber([], [descriptor]);
+    await settle();
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      type: 'full_relay',
+      id: 'full-race-1',
+      mode: 'full',
+      tool: 'list_directory',
+      path: ''
+    });
+    expect(sends).toBe(1);
+    expect(composerText(live.document)).toBe('');
+
+    // Repainting the same final message must not execute or inject it a second time.
+    await replyFiber([], [descriptor]);
+    await settle();
+    expect(requests).toHaveLength(1);
+    expect(sends).toBe(1);
   });
 });

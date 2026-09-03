@@ -38,8 +38,8 @@ describe('extension release metadata', () => {
     expect(lock.version).toBe(APP_VERSION);
     expect(lock.packages?.['']?.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
-    expect(BRIDGE_PROTOCOL).toBe(8);
-    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 8;');
+    expect(BRIDGE_PROTOCOL).toBe(9);
+    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 9;');
   });
 
   /**
@@ -718,6 +718,90 @@ describe('worker settings authority', () => {
       error: 'stale_conversation'
     });
     expect(fetch.mock.calls.some(([input]) => new URL(String(input)).pathname === '/settings')).toBe(false);
+  });
+});
+
+describe('Planner Relay forwarding', () => {
+  const paired = { port: 8765, token: 'paired-token' };
+
+  it('forwards only the allowlisted planner payload through the existing bridge call', async () => {
+    const posted: Record<string, unknown>[] = [];
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/planner/relay') {
+        const body = JSON.parse(String(init.body || '{}')) as Record<string, unknown>;
+        posted.push(body);
+        return response(200, { id: body.id, tool: body.tool, ok: true, path: body.path, entries: [] });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch });
+    await worker.registerTab(52);
+
+    const reply = await worker.send({ type: 'planner_relay', id: 'req-1', tool: 'list_directory', path: 'orca_loop' }, 52);
+    expect(reply).toMatchObject({ id: 'req-1', tool: 'list_directory', ok: true, entries: [] });
+    expect(posted).toEqual([{ id: 'req-1', tool: 'list_directory', path: 'orca_loop' }]);
+
+    const rejected = await worker.send({ type: 'planner_relay', id: 'req-2', tool: 'exec_command', path: '.' }, 52);
+    expect(rejected).toMatchObject({ ok: false, error: 'invalid_request' });
+    expect(posted).toHaveLength(1);
+  });
+
+  it('rejects a relay message from a superseded document before network access', async () => {
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      return response(404, {});
+    });
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch });
+    await worker.registerTab(53, 'document-53-0');
+    await worker.navigateTab(53, 'https://chatgpt.com/c/bbbbbbbb-cccc-dddd-eeee-ffffffffffff');
+    const stale = await worker.send(
+      { type: 'planner_relay', id: 'req-stale', tool: 'read_file', path: 'orca_loop/machine.py' },
+      53,
+      'document-53-0'
+    );
+    expect(stale).toMatchObject({ ok: false, error: 'stale_document' });
+    expect(fetch.mock.calls.some(([input]) => new URL(String(input)).pathname === '/planner/relay')).toBe(false);
+  });
+});
+
+describe('Full Relay forwarding', () => {
+  const paired = { port: 8765, token: 'paired-token' };
+  const chat = 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff';
+
+  it('adds the registered tab conversation identity and forwards only full-mode tools', async () => {
+    const posted: Record<string, unknown>[] = [];
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/full/relay') {
+        const body = JSON.parse(String(init.body || '{}')) as Record<string, unknown>;
+        posted.push(body);
+        return response(200, { id: body.id, mode: 'full', tool: body.tool, ok: true, result: {} });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch });
+    await worker.registerTab(54);
+    await worker.send({ type: 'bind', conversationId: chat }, 54);
+
+    const reply = await worker.send(
+      { type: 'full_relay', id: 'full-1', mode: 'full', tool: 'list_directory', path: 'src' },
+      54
+    );
+    expect(reply).toMatchObject({ id: 'full-1', mode: 'full', tool: 'list_directory', ok: true });
+    expect(posted).toEqual([
+      { id: 'full-1', mode: 'full', tool: 'list_directory', path: 'src', conversationId: chat }
+    ]);
+
+    const rejected = await worker.send(
+      { type: 'full_relay', id: 'full-2', mode: 'planner', tool: 'list_directory', path: 'src' },
+      54
+    );
+    expect(rejected).toMatchObject({ ok: false, error: 'invalid_request' });
+    expect(posted).toHaveLength(1);
   });
 });
 

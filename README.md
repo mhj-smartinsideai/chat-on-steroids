@@ -123,7 +123,7 @@ The important boundaries are simple:
 - **Desktop control is Windows-only and not folder-scoped.** Screen capture, mouse/keyboard input and clipboard access apply to the Windows desktop when their permissions are enabled.
 - **The MCP server is loopback-only.** A random secret path protects each local connector. ChatGPT reaches it through the tunnel you configure; treat any complete public tunnel URL as a secret.
 - **Secrets use Electron `safeStorage`**: DPAPI on Windows, Keychain on macOS, and a desktop secret store such as libsecret/KWallet on Linux. The app refuses Linux's unencrypted `basic_text` fallback and explains how to enable a keyring.
-- **The browser bridge is separate and loopback-only.** It exists for the companion extension and does not expose file, command or settings routes.
+- **The browser bridge is separate and loopback-only.** It exists for the companion extension and exposes only authenticated, bounded Planner Relay and Full Relay routes; it has no general filesystem, command or settings API.
 
 Read-only mode is the fast kill switch for local mutation: it disables file writes, command execution, desktop control and clipboard writes while leaving read-only capabilities available. See [`SECURITY.md`](SECURITY.md) for reporting and scope.
 
@@ -140,11 +140,42 @@ Core declares eight possible names but exposes at most seven at once because `fi
 
 The public tool contract and permission mapping live in [`docs/tool-surface.md`](docs/tool-surface.md).
 
+### ChatGPT Desktop Full Mode
+
+When ChatGPT Desktop Site Tools/WebMCP is available, open
+`http://127.0.0.1:8771/full` in its built-in browser. The page registers a stable snapshot of
+the currently enabled Core and Windows-only Desktop model-facing tools. It calls the same
+handlers and live permission checks as MCP; it does not receive MCP connector secrets.
+
+`/planner` remains a separate restricted planning page with only repository inspection and
+`docs/tasks/**` planning writes. `/full` is the broader surface and never changes Planner's
+allowlist. Refresh the page after changing permissions to refresh tool exposure; a registered
+tool still rechecks the current permission on every invocation.
+
+Full Mode is loopback-only. If command execution is enabled, commands run with the normal
+Windows user privileges and are not confined to approved folders. If Desktop permissions are
+enabled, screen, mouse, keyboard and clipboard operations may affect the entire Windows
+desktop. Read-only mode remains the existing kill switch for file mutation, commands, desktop
+control and clipboard writes.
+
+### Browser Extension Full Relay
+
+The companion extension can relay explicit assistant `<local_tool>` blocks whose JSON contains
+`"mode":"full"`. Enable it in Advanced settings and select exactly one approved folder. It is
+disabled by default, separate from Planner Relay and from ChatGPT Desktop WebMCP `/full`.
+
+Only complete blocks in a finished assistant response are considered. User messages, fenced
+examples, malformed blocks and `<local_tool_result>` blocks are inert. The app validates each
+request again, applies the selected-root sandbox and existing Core permissions, and returns a
+bounded `<local_tool_result>` through the existing composer path. Commands start in the selected
+folder but retain normal logged-in user privileges; the approved folder does not sandbox shell
+commands.
+
 ## Session recording and the extension
 
 Session recording is **on by default for new installs** and can be disabled. It stores the local history needed for the Chat timeline and `session` lookup under the app's per-user data directory: `%APPDATA%\chat-on-steroids\sessions\` on Windows, `~/Library/Application Support/chat-on-steroids/sessions/` on macOS, and `${XDG_CONFIG_HOME:-~/.config}/chat-on-steroids/sessions/` on Linux. The small Activity log is separate, capped, redacted and memory-only. Session retention defaults to 30 days.
 
-The bundled Chrome extension adds browser-side conversation identity, page-visible transcript capture, richer tool rows, Compact & Resume, and worker-tab coordination. It runs only on `chatgpt.com` / `chat.openai.com` plus the app's loopback bridge ports. App and extension versions move together, so after updating the app, use **Reload** for the unpacked extension in `chrome://extensions`.
+The bundled Chrome extension adds browser-side conversation identity, page-visible transcript capture, richer tool rows, Compact & Resume, worker-tab coordination and the opt-in Browser Extension Full Relay. It runs only on `chatgpt.com` / `chat.openai.com` plus the app's loopback bridge ports. App and extension versions move together, so after updating the app, use **Reload** for the unpacked extension in `chrome://extensions`.
 
 ### Compact & Resume
 
@@ -254,7 +285,7 @@ This is experimental browser automation, and parallel chats can edit the same fi
 ## Troubleshooting
 
 - **Tools missing or still visible after a permission change:** refresh/review the custom app in ChatGPT, or recreate it if needed, then start a new conversation so it discovers the current schema.
-- **Extension says app not found:** session recording or multi-agent mode must be on for the browser bridge to run; then reopen the extension popup.
+- **Extension says app not found:** session recording, multi-agent mode or Full Relay must be on for the browser bridge to run; then reopen the extension popup.
 - **Extension version mismatch:** reload the unpacked extension after every app update.
 - **`agents` says `UNIDENTIFIED_CALLER`:** open/use that same ChatGPT conversation in the paired desktop browser so the extension can observe its connector request id. The app intentionally will not infer agent identity from the active tab or timing.
 - **OS/browser warning about an unverified app:** expected for the unsigned beta. Verify `SHA256SUMS.txt` before overriding an OS trust prompt.

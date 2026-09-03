@@ -414,6 +414,13 @@
                 <label class="inline"><input type="checkbox" id="minimizeToTray" /> <span id="minimizeToTrayCopy">Keep running when closed</span></label>
                 <label class="inline" id="privacyScreenshotsSetting"><input type="checkbox" id="privacyScreenshots" /> Privacy screenshots: default to the active window instead of the whole monitor</label>
               </div>
+
+              <div class="field" id="fullRelaySetting">
+                <label class="inline"><input type="checkbox" id="fullRelayEnabled" /> Enable Full Relay for assistant <code>mode:"full"</code> blocks</label>
+                <label for="fullRelayRoot">Full Relay approved folder</label>
+                <select id="fullRelayRoot"></select>
+                <p class="hint">Full Relay is separate from Planner Relay. It can use only this one approved folder and remains disabled until explicitly enabled.</p>
+              </div>
             </details>
           </div>
         </section>

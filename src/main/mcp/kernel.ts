@@ -360,6 +360,7 @@ async function dispatch(
   args: unknown,
   transportKey: string | null,
   requestId: string | null,
+  callerConversationId: string | null,
   surface: SurfaceId,
   run: () => Promise<ToolResult>
 ): Promise<ToolResult> {
@@ -373,7 +374,7 @@ async function dispatch(
     startedAt: Date.now(),
     transportKey,
     agent: null,
-    caller: { transportKey, requestId, conversationId: null },
+    caller: { transportKey, requestId, conversationId: callerConversationId },
     outcome: null,
     evidence: emptyEvidence()
   };
@@ -750,6 +751,33 @@ export interface ToolAnnotations {
 }
 
 /**
+ * Protocol-neutral registration produced by a model-facing surface.
+ *
+ * The MCP connector and the local WebMCP adapter both consume this same registration. The
+ * adapter owns transport details; the surface continues to own the schema and handler.
+ */
+export interface SurfaceToolRegistration {
+  name: string;
+  config: {
+    title?: string;
+    description: string;
+    inputSchema: z.ZodType;
+    outputSchema?: z.ZodType;
+    annotations?: ToolAnnotations;
+  };
+  /**
+   * The optional caller id is an app-internal bridge identity. MCP never supplies it; the
+   * extension bridge may supply the exact authorized document conversation so recorder,
+   * workspace and terminal ownership remain attached to the browser chat that submitted it.
+   */
+  invoke: (
+    args: unknown,
+    transportKey: string | null,
+    callerConversationId?: string | null
+  ) => Promise<ToolResult>;
+}
+
+/**
  * What a surface module is handed to register its tools with.
  *
  * Passing a small object rather than the raw `McpServer` is what keeps the two surface
@@ -787,7 +815,11 @@ export interface SurfaceRegistrar {
   registered(): string[];
 }
 
-export function createRegistrar(server: McpServer, ctx: ToolContext, surface: SurfaceId): SurfaceRegistrar {
+function createSurfaceRegistrarInternal(
+  ctx: ToolContext,
+  surface: SurfaceId,
+  sink: (registration: SurfaceToolRegistration) => void
+): SurfaceRegistrar {
   const caps = ctx.caps;
   const exposedCaps = ctx.exposedCaps ?? caps;
   // These two do not follow a capability checkbox: they are whole features the user
@@ -816,10 +848,14 @@ export function createRegistrar(server: McpServer, ctx: ToolContext, surface: Su
       // No identity field is ever added here. Every tool's schema is exactly what its
       // surface declared: who is calling is a fact about the conversation, established from
       // page evidence in `dispatch`, and never something the model is asked to carry.
-      server.registerTool(name, config, ((args: never, mcpCtx?: McpCallContext) =>
-        dispatch(name, args, mcpCtx?.sessionId ?? null, requestIdOf(mcpCtx), surface, () =>
-          handler(args)
-        )) as never);
+      sink({
+        name,
+        config,
+        invoke: (args, transportKey, callerConversationId = null) =>
+          dispatch(name, args, transportKey, requestIdOf(undefined), callerConversationId, surface, () =>
+            handler(args as never)
+          )
+      });
     },
     guarded(cap, name, fn) {
       return guard(name, async () => {
@@ -839,6 +875,24 @@ export function createRegistrar(server: McpServer, ctx: ToolContext, surface: Su
       );
     }
   };
+}
+
+export function createSurfaceRegistrar(
+  ctx: ToolContext,
+  surface: SurfaceId,
+  sink: (registration: SurfaceToolRegistration) => void
+): SurfaceRegistrar {
+  return createSurfaceRegistrarInternal(ctx, surface, sink);
+}
+
+export function createRegistrar(server: McpServer, ctx: ToolContext, surface: SurfaceId): SurfaceRegistrar {
+  return createSurfaceRegistrarInternal(ctx, surface, (registration) => {
+    server.registerTool(
+      registration.name,
+      registration.config,
+      ((args: unknown, mcpCtx?: McpCallContext) => registration.invoke(args, mcpCtx?.sessionId ?? null)) as never
+    );
+  });
 }
 
 // ------------------------------------------------------------------ formatters

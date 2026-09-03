@@ -4,9 +4,10 @@
  * The pairing token lives here and in chrome.storage.local, never in a content
  * script and never in the page. A content script that were somehow compromised can
  * ask this worker to post observations about the page it is already reading; it
- * cannot read the token, cannot reach the app on its own (the app refuses a
- * https://chatgpt.com origin), and there is no message that makes the app touch a
- * file, run a command or change a permission.
+ * cannot read the token or reach the app on its own (the app refuses a
+ * https://chatgpt.com origin). The worker forwards only the fixed observation,
+ * Planner Relay and Full Relay message contracts; it cannot invoke arbitrary IPC
+ * methods or change a permission.
  *
  * Discovery is a scan of five fixed loopback ports for a /hello that identifies the
  * app. Nothing is broadcast and nothing listens.
@@ -24,7 +25,7 @@ const PORTS = [8765, 8766, 8767, 8768, 8769];
 const HELLO_TIMEOUT_MS = 1200;
 const REQUEST_TIMEOUT_MS = 10_000;
 /** Bumped only when the request/response shape changes; the app compares it. */
-const BRIDGE_PROTOCOL = 8;
+const BRIDGE_PROTOCOL = 9;
 
 /**
  * Journal caps. The byte figure is what actually matters — chrome.storage.session has a
@@ -1632,6 +1633,170 @@ function serializeTab(tab, operation) {
   return tracked;
 }
 
+function plannerRelayPayload(message) {
+  if (!message || typeof message !== 'object' || Array.isArray(message)) return null;
+  if (message.type !== 'planner_relay') return null;
+  const tool = typeof message.tool === 'string' ? message.tool : '';
+  const fields = {
+    list_directory: ['type', 'navigationEpoch', 'id', 'tool', 'path'],
+    read_file: ['type', 'navigationEpoch', 'id', 'tool', 'path', 'start_line', 'end_line'],
+    search_files: ['type', 'navigationEpoch', 'id', 'tool', 'path', 'query'],
+    write_plan: ['type', 'navigationEpoch', 'id', 'tool', 'path', 'content']
+  }[tool];
+  if (!fields || Object.keys(message).some((key) => !fields.includes(key))) return null;
+  if (typeof message.id !== 'string' || message.id.trim() === '' || message.id.length > 64) return null;
+  if (typeof message.path !== 'string' || message.path.length > 4096) return null;
+  if (tool === 'read_file') {
+    if (message.start_line !== undefined && (!Number.isSafeInteger(message.start_line) || message.start_line < 1)) return null;
+    if (message.end_line !== undefined && (!Number.isSafeInteger(message.end_line) || message.end_line < 1)) return null;
+  }
+  if (tool === 'search_files' && (typeof message.query !== 'string' || message.query.length === 0 || message.query.length > 512)) return null;
+  if (tool === 'write_plan' && (typeof message.content !== 'string' || message.content.length === 0 || message.content.length > 200 * 1024)) return null;
+  const result = { id: message.id.trim(), tool, path: message.path };
+  if (tool === 'read_file') {
+    if (message.start_line !== undefined) result.start_line = message.start_line;
+    if (message.end_line !== undefined) result.end_line = message.end_line;
+  } else if (tool === 'search_files') {
+    result.query = message.query;
+  } else if (tool === 'write_plan') {
+    result.content = message.content;
+  }
+  return result;
+}
+
+function fullRelayPath(value, allowEmpty = false, allowCurrent = false) {
+  if (typeof value !== 'string' || value.length > 4096 || (!allowEmpty && value.length === 0)) return null;
+  if (value.length === 0) return '';
+  if (/^(?:[/\\]|[A-Za-z]:[/\\]|\\\\)/.test(value)) return null;
+  const segments = value.split(/[\\/]/);
+  if (segments.some((segment) => segment.length === 0 || segment === '..' || (!allowCurrent && segment === '.'))) return null;
+  if (segments.some((segment) => [...segment].some((character) => character < ' '))) return null;
+  return segments.filter((segment) => segment !== '.').join('/');
+}
+
+function fullRelayString(value, max, allowEmpty = false, allowControls = false) {
+  if (typeof value !== 'string' || value.length > max || (!allowEmpty && value.trim() === '')) return null;
+  if (!allowControls && [...value].some((character) => character < ' ')) return null;
+  return value;
+}
+
+function fullRelayInteger(value, min, max) {
+  return Number.isSafeInteger(value) && value >= min && value <= max ? value : null;
+}
+
+function fullRelayCommandArgument(value, max) {
+  const argument = fullRelayString(value, max, true, true);
+  return argument === null || argument.includes('\0') ? null : argument;
+}
+
+function fullRelayPayload(message) {
+  if (!message || typeof message !== 'object' || Array.isArray(message)) return null;
+  if (message.type !== 'full_relay' || message.mode !== 'full') return null;
+  const tool = typeof message.tool === 'string' ? message.tool : '';
+  const fields = {
+    list_directory: ['type', 'navigationEpoch', 'id', 'mode', 'tool', 'path'],
+    read_file: ['type', 'navigationEpoch', 'id', 'mode', 'tool', 'path', 'start_line', 'end_line', 'max_bytes'],
+    search_files: ['type', 'navigationEpoch', 'id', 'mode', 'tool', 'path', 'query', 'include', 'exclude', 'case_sensitive', 'regex', 'max_results'],
+    write_file: ['type', 'navigationEpoch', 'id', 'mode', 'tool', 'path', 'content'],
+    apply_patch: ['type', 'navigationEpoch', 'id', 'mode', 'tool', 'patch'],
+    exec_command: ['type', 'navigationEpoch', 'id', 'mode', 'tool', 'cmd', 'cmds', 'command', 'cwd', 'shell', 'tty', 'login', 'yield_time_ms', 'timeout_ms', 'max_output_tokens'],
+    write_stdin: ['type', 'navigationEpoch', 'id', 'mode', 'tool', 'session_id', 'input', 'yield_time_ms', 'max_output_tokens']
+  }[tool];
+  if (!fields || Object.keys(message).some((key) => !fields.includes(key))) return null;
+  const id = fullRelayString(message.id, 64);
+  if (!id) return null;
+  const result = { id: id.trim(), mode: 'full', tool };
+  if (tool === 'list_directory') {
+    const path = fullRelayPath(message.path, true);
+    return path === null ? null : { ...result, path };
+  }
+  if (tool === 'read_file') {
+    const path = fullRelayPath(message.path);
+    if (path === null) return null;
+    if (message.start_line !== undefined && fullRelayInteger(message.start_line, 1, 1_000_000) === null) return null;
+    if (message.end_line !== undefined && fullRelayInteger(message.end_line, 1, 1_000_000) === null) return null;
+    if (message.start_line !== undefined && message.end_line !== undefined && message.end_line < message.start_line) return null;
+    if (message.max_bytes !== undefined && fullRelayInteger(message.max_bytes, 1, 512 * 1024) === null) return null;
+    return {
+      ...result,
+      path,
+      ...(message.start_line === undefined ? {} : { start_line: message.start_line }),
+      ...(message.end_line === undefined ? {} : { end_line: message.end_line }),
+      ...(message.max_bytes === undefined ? {} : { max_bytes: message.max_bytes })
+    };
+  }
+  if (tool === 'search_files') {
+    const path = fullRelayPath(message.path, true);
+    const query = fullRelayString(message.query, 1000);
+    if (path === null || query === null) return null;
+    if (message.include !== undefined && fullRelayString(message.include, 200) === null) return null;
+    if (message.exclude !== undefined && (!Array.isArray(message.exclude) || message.exclude.length > 50 || message.exclude.some((item) => fullRelayString(item, 100) === null))) return null;
+    if (message.case_sensitive !== undefined && typeof message.case_sensitive !== 'boolean') return null;
+    if (message.regex !== undefined && typeof message.regex !== 'boolean') return null;
+    if (message.max_results !== undefined && fullRelayInteger(message.max_results, 1, 500) === null) return null;
+    return {
+      ...result,
+      path,
+      query,
+      ...(message.include === undefined ? {} : { include: message.include }),
+      ...(message.exclude === undefined ? {} : { exclude: message.exclude }),
+      ...(message.case_sensitive === undefined ? {} : { case_sensitive: message.case_sensitive }),
+      ...(message.regex === undefined ? {} : { regex: message.regex }),
+      ...(message.max_results === undefined ? {} : { max_results: message.max_results })
+    };
+  }
+  if (tool === 'write_file') {
+    const path = fullRelayPath(message.path);
+    const content = fullRelayString(message.content, 1_000_000, true, true);
+    return path === null || content === null ? null : { ...result, path, content };
+  }
+  if (tool === 'apply_patch') {
+    const patch = fullRelayString(message.patch, 1_000_000, false, true);
+    return patch === null ? null : { ...result, patch };
+  }
+  if (tool === 'exec_command') {
+    const hasCmd = Object.prototype.hasOwnProperty.call(message, 'cmd');
+    const hasCmds = Object.prototype.hasOwnProperty.call(message, 'cmds');
+    const hasCommand = Object.prototype.hasOwnProperty.call(message, 'command');
+    if (Number(hasCmd) + Number(hasCmds) + Number(hasCommand) !== 1) return null;
+    if (hasCmd && fullRelayString(message.cmd, 100_000, false, true) === null) return null;
+    if (hasCmds && (!Array.isArray(message.cmds) || message.cmds.length < 1 || message.cmds.length > 20 || message.cmds.some((item) => fullRelayString(item, 100_000, false, true) === null))) return null;
+    if (hasCommand && (!Array.isArray(message.command) || message.command.length < 1 || message.command.length > 20 || message.command.some((item) => fullRelayCommandArgument(item, 100_000) === null) || fullRelayCommandArgument(message.command[0], 100_000)?.trim() === '')) return null;
+    const cwd = message.cwd === undefined ? undefined : fullRelayPath(message.cwd, true, true);
+    if (cwd === null) return null;
+    if (message.shell !== undefined && fullRelayString(message.shell, 4096) === null) return null;
+    if (message.tty !== undefined && typeof message.tty !== 'boolean') return null;
+    if (message.login !== undefined && typeof message.login !== 'boolean') return null;
+    if (message.yield_time_ms !== undefined && fullRelayInteger(message.yield_time_ms, 0, 120_000) === null) return null;
+    if (message.timeout_ms !== undefined && fullRelayInteger(message.timeout_ms, 0, 300_000) === null) return null;
+    if (message.timeout_ms !== undefined && message.yield_time_ms !== undefined) return null;
+    if (message.max_output_tokens !== undefined && fullRelayInteger(message.max_output_tokens, 1, 10_000) === null) return null;
+    return {
+      ...result,
+      ...(hasCmd ? { cmd: message.cmd } : hasCmds ? { cmds: message.cmds } : { command: message.command }),
+      ...(cwd === undefined ? {} : { cwd }),
+      ...(message.shell === undefined ? {} : { shell: message.shell }),
+      ...(message.tty === undefined ? {} : { tty: message.tty }),
+      ...(message.login === undefined ? {} : { login: message.login }),
+      ...(message.yield_time_ms === undefined ? {} : { yield_time_ms: message.yield_time_ms }),
+      ...(message.timeout_ms === undefined ? {} : { timeout_ms: message.timeout_ms }),
+      ...(message.max_output_tokens === undefined ? {} : { max_output_tokens: message.max_output_tokens })
+    };
+  }
+  const sessionId = fullRelayInteger(message.session_id, 1, 2_147_483_647);
+  if (sessionId === null) return null;
+  if (message.input !== undefined && fullRelayString(message.input, 100_000, true, true) === null) return null;
+  if (message.yield_time_ms !== undefined && fullRelayInteger(message.yield_time_ms, 0, 120_000) === null) return null;
+  if (message.max_output_tokens !== undefined && fullRelayInteger(message.max_output_tokens, 1, 10_000) === null) return null;
+  return {
+    ...result,
+    session_id: sessionId,
+    ...(message.input === undefined ? {} : { input: message.input }),
+    ...(message.yield_time_ms === undefined ? {} : { yield_time_ms: message.yield_time_ms }),
+    ...(message.max_output_tokens === undefined ? {} : { max_output_tokens: message.max_output_tokens })
+  };
+}
+
 const HANDLERS = {
   async register_document(_message, sender) {
     const result = await registerDocument(sender, _message);
@@ -1894,6 +2059,80 @@ const HANDLERS = {
       `&goalClient=${encodeURIComponent(String(source.tab))}`;
     const result = await call(`/activity${query}`);
     return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
+  },
+  /** Forwards one validated Planner Relay request from the exact current document. */
+  async planner_relay(message, _sender, source) {
+    await load();
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const request = plannerRelayPayload(message);
+    if (!request) return { ok: false, error: 'invalid_request' };
+    const result = await call('/planner/relay', {
+      method: 'POST',
+      body: JSON.stringify(request)
+    });
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    if (result.ok && result.data && typeof result.data === 'object') {
+      const data = result.data;
+      if (data.id === request.id && data.tool === request.tool && typeof data.ok === 'boolean') return data;
+    }
+    return {
+      id: request.id,
+      tool: request.tool,
+      ok: false,
+      error: result.data && typeof result.data.error === 'string'
+        ? result.data.error
+        : result.error || `HTTP ${result.status}`
+    };
+  },
+  /** Forwards one validated Full Relay request from the exact current document. */
+  async full_relay(message, _sender, source) {
+    await load();
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const request = fullRelayPayload(message);
+    if (!request) return { ok: false, error: 'invalid_request' };
+    console.info('[COS][background:dispatch:full]', {
+      id: request.id,
+      mode: request.mode,
+      tool: request.tool,
+      tab: source.tab
+    });
+    const conversationId = cleanConversationId(tabConversations[String(source.tab)]);
+    if (!conversationId) {
+      console.warn('[COS][relay:error]', {
+        id: request.id,
+        mode: 'full',
+        tool: request.tool,
+        error: 'conversation_required'
+      });
+      return { id: request.id, mode: 'full', tool: request.tool, ok: false, error: 'conversation_required' };
+    }
+    console.info('[COS][relay:post]', { id: request.id, mode: 'full', tool: request.tool, conversationId });
+    const result = await call('/full/relay', {
+      method: 'POST',
+      body: JSON.stringify({ ...request, conversationId })
+    });
+    console.info('[COS][relay:response]', {
+      id: request.id,
+      mode: 'full',
+      tool: request.tool,
+      ok: result.ok === true,
+      status: result.status,
+      ...(result.ok ? {} : { error: result.error || `HTTP ${result.status}` })
+    });
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    if (result.ok && result.data && typeof result.data === 'object') {
+      const data = result.data;
+      if (data.id === request.id && data.mode === 'full' && data.tool === request.tool && typeof data.ok === 'boolean') return data;
+    }
+    return {
+      id: request.id,
+      mode: 'full',
+      tool: request.tool,
+      ok: false,
+      error: result.data && typeof result.data.error === 'string'
+        ? result.data.error
+        : result.error || `HTTP ${result.status}`
+    };
   },
   /** Reinstall the least-trusted MAIN-world reader when a live content script loses it. */
   async repair_fiber(_message, _sender, source) {
@@ -2201,6 +2440,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'activity',
     'correlate',
     'closed',
+    'planner_relay',
+    'full_relay',
     'compact',
     'auto_compact_claim',
     'goal_draft',

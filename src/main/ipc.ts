@@ -115,6 +115,12 @@ const settingsPatch = z.object({
     enabled: z.boolean(),
     maxWorkers: z.number().int().min(1).max(8)
   }),
+  fullRelay: z
+    .object({
+      enabled: z.boolean(),
+      rootName: z.string().max(32).regex(/^[a-z0-9][a-z0-9._-]*$|^$/)
+    })
+    .optional(),
   goal: z.object({
     enabled: z.boolean(),
     // An OpenRouter model id, and validated only as a shape: the catalogue changes weekly,
@@ -151,6 +157,9 @@ type SettingsSnapshot = z.infer<typeof settingsPatch>;
  */
 function mergeSettings(current: Config, base: SettingsSnapshot, wanted: SettingsSnapshot): SettingsSnapshot {
   const pick = <T>(live: T, before: T, next: T): T => (Object.is(before, next) ? live : next);
+  const currentFullRelay = current.fullRelay;
+  const baseFullRelay = base.fullRelay ?? currentFullRelay;
+  const wantedFullRelay = wanted.fullRelay ?? currentFullRelay;
   const capabilities = Object.fromEntries(
     CAPABILITIES.map((capability) => [
       capability,
@@ -197,6 +206,10 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
     multiAgent: {
       enabled: pick(current.multiAgent.enabled, base.multiAgent.enabled, wanted.multiAgent.enabled),
       maxWorkers: pick(current.multiAgent.maxWorkers, base.multiAgent.maxWorkers, wanted.multiAgent.maxWorkers)
+    },
+    fullRelay: {
+      enabled: pick(currentFullRelay.enabled, baseFullRelay.enabled, wantedFullRelay.enabled),
+      rootName: pick(currentFullRelay.rootName, baseFullRelay.rootName, wantedFullRelay.rootName)
     },
     goal: {
       enabled: pick(current.goal.enabled, base.goal.enabled, wanted.goal.enabled),
@@ -278,7 +291,13 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
     const request = settingsSave.parse(payload);
     const before = getConfig();
     const wasMultiAgent = before.multiAgent.enabled;
-    const next = await updateConfig((config) => ({ ...config, ...mergeSettings(config, request.base, request.patch) }));
+    const next = await updateConfig((config) => {
+      const merged = { ...config, ...mergeSettings(config, request.base, request.patch) };
+      if (merged.fullRelay.enabled && !merged.roots.some((root) => root.name === merged.fullRelay.rootName)) {
+        throw new Error('Full Relay requires one selected approved folder.');
+      }
+      return merged;
+    });
     // Renderer palette changes are immediate, so keep OS/Electron-owned chrome in lock-step too.
     // Without this, selecting Dark on macOS left the title bar, menus and file picker in the
     // system theme until restart (and startup still defaulted to system before index.ts applies it).
@@ -320,11 +339,12 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
         authorityPersistError = error instanceof Error ? error : new Error(String(error));
       }
     }
-    // The extension bridge serves both features: recording needs it to observe the
-    // chat, and multi-agent mode needs it to open worker tabs. Either one being on is
-    // enough, and this must match the startup rule in index.ts exactly — a bridge that
-    // runs at startup but not after a settings save is the worst of both.
-    if (next.sessions.record || next.multiAgent.enabled) await startBridge();
+    // The extension bridge serves recording, multi-agent mode and browser Full Relay:
+    // recording needs it to observe the chat, multi-agent mode needs it to open worker tabs,
+    // and Full Relay needs its authenticated request path. Any one being on is enough, and
+    // this must match the startup rule in index.ts exactly — a bridge that runs at startup but
+    // not after a settings save is the worst of both.
+    if (next.sessions.record || next.multiAgent.enabled || next.fullRelay.enabled) await startBridge();
     else await stopBridge();
     // Permissions and the second tunnel id both decide whether the optional Desktop
     // connector should be published. Without this, enabling desktop access or pasting its
@@ -366,7 +386,11 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
       if (!config.roots.some((root) => root.name === name)) throw new Error(`/${name} is not an approved folder`);
       return {
         ...config,
-        roots: config.roots.filter((r) => r.name !== name)
+        roots: config.roots.filter((r) => r.name !== name),
+        fullRelay:
+          config.fullRelay.rootName === name
+            ? { enabled: false, rootName: '' }
+            : config.fullRelay
       };
     });
     forgetWorkspaceRoot(name);
@@ -386,7 +410,11 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
       }
       return {
         ...config,
-        roots: config.roots.map((r) => (r.name === name ? { ...r, name: newName } : r))
+        roots: config.roots.map((r) => (r.name === name ? { ...r, name: newName } : r)),
+        fullRelay:
+          config.fullRelay.rootName === name
+            ? { ...config.fullRelay, rootName: newName }
+            : config.fullRelay
       };
     });
     renameWorkspaceRoot(name, newName);

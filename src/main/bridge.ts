@@ -16,8 +16,9 @@
  *   · bodies are capped and requests are rate limited
  *
  * It is deliberately not a general control API. It accepts observations about a
- * ChatGPT conversation and hands back activity summaries and queued commands. It
- * cannot read a file, run anything, or change a permission.
+ * ChatGPT conversation and hands back activity summaries and queued commands. The one
+ * filesystem exceptions are /planner/relay and /full/relay. Both dispatch only bounded
+ * operations through the approved-root sandbox; neither route is a general control API.
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
@@ -114,6 +115,8 @@ import { APP_VERSION, BRIDGE_PROTOCOL } from './version.js';
 import { requestCorrelation } from './session/correlation.js';
 import { bindAgentWorkspace } from './workspace.js';
 import { MAX_GOAL_OBJECTIVE_CHARS } from '../shared/goal.js';
+import { executePlannerRelay, PlannerRelayRequestError } from './planner/codex-mhj_26_09_02_07_relay.js';
+import { executeFullRelay, FullRelayRequestError } from './full/codex-mhj_26_09_02_09_relay.js';
 
 /** Fixed candidates so the extension can find the app without being told a port. */
 export const DEFAULT_PORTS = [8765, 8766, 8767, 8768, 8769];
@@ -920,8 +923,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // is simply issued to whoever asks on 127.0.0.1 rather than to whoever can read the
     // window. What that gives up is stated plainly: any program already running as this
     // user can obtain the token, and with it read recorded ChatGPT activity and queue an
-    // "open a fresh chat" command. It can still not read a file, run anything, or change
-    // a permission — the bridge has no route that does. A web page cannot: originOf
+    // "open a fresh chat" command. It can still not run anything or change a permission;
+    // /planner/relay is limited to its four bounded operations. A web page cannot: originOf
     // refuses anything that is not a chrome-extension:// origin, above.
     const token = randomBytes(32).toString('base64url');
     await setSecret('bridgeToken', token);
@@ -943,6 +946,46 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // consume the browser's shared budget before failing origin/authentication.
   if (rateLimited()) return json(res, 429, { error: 'rate_limited' }, origin);
   if (noteBrowserSeen()) changed();
+
+  if (route === '/planner/relay' && req.method === 'POST') {
+    let body: unknown;
+    try {
+      body = await readBody(req);
+    } catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { ok: false, error: 'invalid_request' }, origin);
+    }
+    try {
+      const result = await executePlannerRelay(body);
+      return json(res, 200, result, origin);
+    } catch (err) {
+      if (err instanceof PlannerRelayRequestError) {
+        return json(res, 400, { ok: false, error: 'invalid_request' }, origin);
+      }
+      logWarn(`bridge: planner relay request failed: ${err instanceof Error ? err.message : String(err)}`);
+      return json(res, 500, { ok: false, error: 'planner_relay_failed' }, origin);
+    }
+  }
+
+  if (route === '/full/relay' && req.method === 'POST') {
+    let body: unknown;
+    try {
+      body = await readBody(req);
+    } catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { ok: false, error: 'invalid_request' }, origin);
+    }
+    try {
+      const result = await executeFullRelay(body);
+      return json(res, 200, result, origin);
+    } catch (err) {
+      if (err instanceof FullRelayRequestError) {
+        return json(res, 400, { ok: false, error: 'invalid_request' }, origin);
+      }
+      logWarn(`bridge: full relay request failed: ${err instanceof Error ? err.message : String(err)}`);
+      return json(res, 500, { ok: false, error: 'full_relay_failed' }, origin);
+    }
+  }
 
   if (route === '/status') {
     const live = liveConversations();

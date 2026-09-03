@@ -99,6 +99,20 @@ function applyChecked(control: HTMLInputElement, next: boolean, previous?: boole
   const dirty = document.activeElement === control && previous !== undefined && control.checked !== previous;
   if (!dirty) control.checked = next;
 }
+
+function paintFullRelayRoots(roots: AppState['config']['roots'], selected: string): void {
+  const control = $<HTMLSelectElement>('fullRelayRoot');
+  if (document.activeElement === control && control.value !== selected) return;
+  const option = (label: string, value: string): HTMLOptionElement => {
+    const item = document.createElement('option');
+    item.textContent = label;
+    item.value = value;
+    return item;
+  };
+  control.replaceChildren(option('Select an approved folder', ''));
+  for (const root of roots) control.append(option(`/${root.name}`, root.name));
+  control.value = roots.some((root) => root.name === selected) ? selected : '';
+}
 /** The one expanded permission group, or null. One at a time keeps the layout still. */
 let openGroup: string | null = null;
 /** Whether the finished setup steps are unfolded again. Reset on every app start. */
@@ -376,6 +390,10 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark' } = {}): Prom
       privacyScreenshots: $<HTMLInputElement>('privacyScreenshots').checked,
       theme: over.theme ?? previous.ui.theme
     },
+    fullRelay: {
+      enabled: $<HTMLInputElement>('fullRelayEnabled').checked,
+      rootName: $<HTMLSelectElement>('fullRelayRoot').value
+    },
     ...chatPatch
   };
   requestedSettings = patch;
@@ -408,6 +426,7 @@ async function saveSnapshot(patch: SettingsPatch, previous: AppState['config']):
     sessions: previous.sessions,
     compaction: previous.compaction,
     multiAgent: previous.multiAgent,
+    fullRelay: previous.fullRelay,
     goal: previous.goal
   };
   const next = await run(api.saveSettings(patch, base));
@@ -721,6 +740,16 @@ function apply(next: AppState): void {
   // ---- folders
   paintRoots(config.roots);
   $('rootsEmpty').hidden = config.roots.length > 0;
+  const fullRelay = config.fullRelay ?? { enabled: false, rootName: '' };
+  const previousFullRelay = previousState?.config.fullRelay;
+  applyChecked(
+    $<HTMLInputElement>('fullRelayEnabled'),
+    fullRelay.enabled,
+    previousFullRelay?.enabled
+  );
+  paintFullRelayRoots(config.roots, fullRelay.rootName);
+  $<HTMLInputElement>('fullRelayEnabled').disabled = config.roots.length === 0;
+  $<HTMLSelectElement>('fullRelayRoot').disabled = config.roots.length === 0;
 
   // ---- nav badge
   $('setupBadge').hidden = missing === null;
@@ -1376,7 +1405,9 @@ for (const id of [
   'privacyScreenshots',
   'tunnelKind',
   'tunnelId',
-  'desktopTunnelId'
+  'desktopTunnelId',
+  'fullRelayEnabled',
+  'fullRelayRoot'
 ]) {
   $(id).addEventListener('change', () => void save());
 }

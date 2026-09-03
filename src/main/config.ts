@@ -17,6 +17,7 @@ import {
   type Capabilities,
   type CompactionSettings,
   type Config,
+  type FullRelaySettings,
   type GoalSettings,
   type MultiAgentSettings,
   type Root,
@@ -83,6 +84,7 @@ const DEFAULT_SESSIONS: SessionSettings = {
   // produce: the red line would move the first time anyone opened the panel and saved.
   limitTokens: Math.round((DEFAULT_CONTEXT_WINDOW * 4) / 3)
 };
+const DEFAULT_FULL_RELAY: FullRelaySettings = { enabled: false, rootName: '' };
 
 /**
  * The 1.7.1 recalibration, applied once to configs that never chose their own numbers.
@@ -272,6 +274,18 @@ const configSchema = z.object({
     })
     .optional()
     .default({ ...DEFAULT_MULTI_AGENT }),
+  fullRelay: z
+    .object({
+      enabled: z.boolean().optional().default(DEFAULT_FULL_RELAY.enabled),
+      rootName: z
+        .string()
+        .max(32)
+        .regex(/^[a-z0-9][a-z0-9._-]*$|^$/, 'Expected an approved folder name or an empty selection')
+        .optional()
+        .default(DEFAULT_FULL_RELAY.rootName)
+    })
+    .optional()
+    .default({ ...DEFAULT_FULL_RELAY }),
   // An empty model id is repaired rather than rejected: the id is free text from a
   // provider listing that changes weekly, and a config that lost it must still load with
   // every root and permission in it intact.
@@ -333,6 +347,7 @@ export function defaultConfig(platform: NodeJS.Platform = process.platform): Con
     sessions: { ...DEFAULT_SESSIONS },
     compaction: { ...DEFAULT_COMPACTION },
     multiAgent: { ...FIRST_LAUNCH_MULTI_AGENT },
+    fullRelay: { ...DEFAULT_FULL_RELAY },
     goal: { ...DEFAULT_GOAL }
   };
 }
@@ -351,6 +366,7 @@ function conservativeRecoveryConfig(): Config {
     capabilities: { ...DEFAULT_CAPABILITIES },
     readOnly: true,
     multiAgent: { ...DEFAULT_MULTI_AGENT },
+    fullRelay: { ...DEFAULT_FULL_RELAY },
     // A config file that could not be trusted is not consent to have a second model typing
     // into the user's chat, whatever the unreadable file said.
     goal: { ...DEFAULT_GOAL }

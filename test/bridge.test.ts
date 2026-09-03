@@ -8,7 +8,7 @@
  */
 
 import http from 'node:http';
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { APP_VERSION, BRIDGE_PROTOCOL } from '../src/main/version.js';
 import type { ContinuationSnapshot } from '../src/main/session/continuation.js';
 import type { SwarmSnapshot } from '../src/main/agents.js';
@@ -351,6 +351,98 @@ describe('who is allowed to talk to it', () => {
   it('refuses a preflight that arrives without an Origin', async () => {
     const reply = await request('OPTIONS', '/events', { origin: null, auth: null });
     expect(reply.status).toBe(403);
+  });
+});
+
+describe('Planner Relay bridge route', () => {
+  it('requires the existing bearer authentication', async () => {
+    const reply = await request('POST', '/planner/relay', {
+      auth: null,
+      body: { id: 'req-1', tool: 'list_directory', path: 'orca_loop' }
+    });
+    expect(reply.status).toBe(401);
+    expect(reply.body.error).toBe('unauthorised');
+  });
+
+  it('dispatches a valid request through the existing bridge and rejects unknown tools', async () => {
+    await pair();
+    const unavailable = await request('POST', '/planner/relay', {
+      body: { id: 'req-2', tool: 'list_directory', path: 'orca_loop' }
+    });
+    expect(unavailable.status).toBe(200);
+    expect(unavailable.body).toMatchObject({ id: 'req-2', tool: 'list_directory', ok: false, error: 'planner_root_unavailable' });
+
+    const rejected = await request('POST', '/planner/relay', {
+      body: { id: 'req-3', tool: 'exec_command', path: '.' }
+    });
+    expect(rejected.status).toBe(400);
+    expect(rejected.body).toMatchObject({ ok: false, error: 'invalid_request' });
+  });
+});
+
+describe('Full Relay bridge route', () => {
+  beforeEach(async () => {
+    const config = defaultConfig('win32');
+    await saveConfig({
+      ...config,
+      roots: [{ name: 'project', path: dir }],
+      sessions: { ...config.sessions, record: false },
+      multiAgent: { ...config.multiAgent, enabled: false },
+      fullRelay: { enabled: true, rootName: 'project' }
+    });
+  });
+
+  afterEach(async () => {
+    const config = defaultConfig();
+    await saveConfig({
+      ...config,
+      sessions: { ...config.sessions, record: true },
+      multiAgent: { ...config.multiAgent, enabled: true }
+    });
+  });
+
+  it('uses the existing bearer route and validates the Full Relay envelope', async () => {
+    const body = {
+      conversationId: 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff',
+      id: 'full-route-1',
+      mode: 'full',
+      tool: 'read_file',
+      path: 'config.json'
+    };
+    const unauthorised = await request('POST', '/full/relay', { auth: null, body });
+    expect(unauthorised.status).toBe(401);
+
+    await pair();
+    const accepted = await request('POST', '/full/relay', { body });
+    expect(accepted.status).toBe(200);
+    expect(accepted.body).toMatchObject({ id: 'full-route-1', mode: 'full', tool: 'read_file', ok: true });
+
+    const malformed = await request('POST', '/full/relay', {
+      body: { ...body, id: 'full-route-2', mode: 'planner' }
+    });
+    expect(malformed.status).toBe(400);
+    expect(malformed.body).toMatchObject({ ok: false, error: 'invalid_request' });
+  });
+
+  it('returns a fail-closed result when Full Relay is disabled', async () => {
+    const config = defaultConfig('win32');
+    await saveConfig({
+      ...config,
+      roots: [{ name: 'project', path: dir }],
+      fullRelay: { enabled: false, rootName: 'project' }
+    });
+    await pair();
+    const reply = await request('POST', '/full/relay', {
+      body: {
+        conversationId: 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff',
+        id: 'full-route-3',
+        mode: 'full',
+        tool: 'list_directory',
+        path: ''
+      }
+    });
+    expect(reply.status).toBe(200);
+    expect(reply.body).toMatchObject({ ok: false, error: 'full_relay_disabled' });
   });
 });
 

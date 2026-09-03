@@ -630,6 +630,29 @@
   let goalBusy = false;
   /** When this tab started trying to type a ready draft, so a held composer eventually gives up. */
   let goalTypingSince = 0;
+
+  const LOCAL_TOOL_MAX_ID_LENGTH = 64;
+  const LOCAL_TOOL_MAX_PATH_LENGTH = 4096;
+  const LOCAL_TOOL_MAX_QUERY_LENGTH = 512;
+  const LOCAL_TOOL_MAX_CONTENT_BYTES = 200 * 1024;
+  const LOCAL_TOOL_MAX_OPERATIONS = 100;
+  const LOCAL_TOOL_INJECTION_WINDOW_MS = 120_000;
+  const LOCAL_TOOL_TAG = /<local_tool>([\s\S]*?)<\/local_tool>/g;
+  const FULL_LOCAL_TOOL_MAX_CONTENT_BYTES = 1_000_000;
+  const FULL_LOCAL_TOOL_MAX_PATCH_BYTES = 1_000_000;
+  const FULL_LOCAL_TOOL_MAX_COMMAND_BYTES = 100_000;
+  const FULL_LOCAL_TOOL_MAX_QUERY_LENGTH = 1_000;
+  const FULL_LOCAL_TOOL_MAX_EXEC_COMMANDS = 20;
+  const fullLocalToolQueue = [];
+  let fullLocalToolOperations = 0;
+  let fullLocalToolDrain = null;
+  const fullRelayCandidates = new Map();
+  const fullRelayCallSeen = new Set();
+  const localToolSeen = new Set();
+  const localToolQueue = [];
+  let localToolOperations = 0;
+  let localToolGeneration = 0;
+  let localToolDrain = null;
   /** Terminal Goal card the user dismissed. Keyed to its chat + finished turn across repaints. */
   let dismissedGoalStage = null;
   /**
@@ -705,6 +728,487 @@
       return text.length * 4;
     }
   };
+
+  function localToolPath(value, allowEmpty = false) {
+    if (typeof value !== 'string' || value.length > LOCAL_TOOL_MAX_PATH_LENGTH || (!allowEmpty && value.length === 0)) return null;
+    if (value.length === 0) return '';
+    if (/^(?:[/\\]|[A-Za-z]:[/\\]|\\\\)/.test(value)) return null;
+    const segments = value.split(/[\\/]/);
+    if (segments.some((segment) => segment.length === 0 || segment === '.' || segment === '..')) return null;
+    if (segments.some((segment) => [...segment].some((character) => character < ' '))) return null;
+    return segments.join('/');
+  }
+
+  function parseLocalToolBlock(value) {
+    let parsed;
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      return null;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const tool = typeof parsed.tool === 'string' ? parsed.tool : '';
+    const allowed = {
+      list_directory: ['id', 'tool', 'path'],
+      read_file: ['id', 'tool', 'path', 'start_line', 'end_line'],
+      search_files: ['id', 'tool', 'path', 'query'],
+      write_plan: ['id', 'tool', 'path', 'content']
+    }[tool];
+    if (!allowed || Object.keys(parsed).some((key) => !allowed.includes(key))) return null;
+    if (typeof parsed.id !== 'string' || parsed.id.trim() === '' || parsed.id.length > LOCAL_TOOL_MAX_ID_LENGTH) return null;
+    const request = { id: parsed.id.trim(), tool, path: localToolPath(parsed.path, tool !== 'read_file') };
+    if (!request.path && !(tool === 'list_directory' || tool === 'search_files')) return null;
+    if (request.path === null) return null;
+    if (tool === 'read_file') {
+      if (parsed.start_line !== undefined && (!Number.isSafeInteger(parsed.start_line) || parsed.start_line < 1)) return null;
+      if (parsed.end_line !== undefined && (!Number.isSafeInteger(parsed.end_line) || parsed.end_line < 1)) return null;
+      if (parsed.start_line !== undefined) request.start_line = parsed.start_line;
+      if (parsed.end_line !== undefined) request.end_line = parsed.end_line;
+      if (request.start_line !== undefined && request.end_line !== undefined && request.end_line < request.start_line) return null;
+    } else if (tool === 'search_files') {
+      if (typeof parsed.query !== 'string' || parsed.query.length === 0 || parsed.query.length > LOCAL_TOOL_MAX_QUERY_LENGTH) return null;
+      request.query = parsed.query;
+    } else if (tool === 'write_plan') {
+      if (typeof parsed.content !== 'string' || parsed.content.length === 0 || utf8Bytes(parsed.content) > LOCAL_TOOL_MAX_CONTENT_BYTES) return null;
+      request.content = parsed.content;
+    }
+    return request;
+  }
+
+  function fullLocalToolPath(value, allowEmpty = false, allowCurrent = false) {
+    if (typeof value !== 'string' || value.length > LOCAL_TOOL_MAX_PATH_LENGTH || (!allowEmpty && value.length === 0)) return null;
+    if (value.length === 0) return '';
+    if (/^(?:[/\\]|[A-Za-z]:[/\\]|\\\\)/.test(value)) return null;
+    const segments = value.split(/[\\/]/);
+    if (segments.some((segment) => segment.length === 0 || segment === '..' || (!allowCurrent && segment === '.'))) return null;
+    if (segments.some((segment) => [...segment].some((character) => character < ' '))) return null;
+    return segments.filter((segment) => segment !== '.').join('/');
+  }
+
+  function fullLocalToolString(value, max, allowEmpty = false, allowControls = false) {
+    if (typeof value !== 'string' || value.length > max || (!allowEmpty && value.trim() === '')) return null;
+    if (!allowControls && [...value].some((character) => character < ' ')) return null;
+    return value;
+  }
+
+  function fullLocalToolInteger(value, min, max) {
+    return Number.isSafeInteger(value) && value >= min && value <= max ? value : null;
+  }
+
+  function fullLocalToolCommandArgument(value, max) {
+    const argument = fullLocalToolString(value, max, true, true);
+    return argument === null || argument.includes('\0') ? null : argument;
+  }
+
+  function parseFullLocalToolBlock(value) {
+    let parsed;
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      return null;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || parsed.mode !== 'full') return null;
+    const tool = typeof parsed.tool === 'string' ? parsed.tool : '';
+    const allowed = {
+      list_directory: ['id', 'mode', 'tool', 'path'],
+      read_file: ['id', 'mode', 'tool', 'path', 'start_line', 'end_line', 'max_bytes'],
+      search_files: ['id', 'mode', 'tool', 'path', 'query', 'include', 'exclude', 'case_sensitive', 'regex', 'max_results'],
+      write_file: ['id', 'mode', 'tool', 'path', 'content'],
+      apply_patch: ['id', 'mode', 'tool', 'patch'],
+       exec_command: ['id', 'mode', 'tool', 'cmd', 'cmds', 'command', 'cwd', 'shell', 'tty', 'login', 'yield_time_ms', 'timeout_ms', 'max_output_tokens'],
+      write_stdin: ['id', 'mode', 'tool', 'session_id', 'input', 'yield_time_ms', 'max_output_tokens']
+    }[tool];
+    if (!allowed || Object.keys(parsed).some((key) => !allowed.includes(key))) return null;
+    if (typeof parsed.id !== 'string' || parsed.id.trim() === '' || parsed.id.length > LOCAL_TOOL_MAX_ID_LENGTH) return null;
+    const request = { id: parsed.id.trim(), mode: 'full', tool };
+    if (tool === 'list_directory') {
+      request.path = fullLocalToolPath(parsed.path, true);
+      return request.path === null ? null : request;
+    }
+    if (tool === 'read_file') {
+      request.path = fullLocalToolPath(parsed.path);
+      if (request.path === null) return null;
+      if (parsed.start_line !== undefined && fullLocalToolInteger(parsed.start_line, 1, 1_000_000) === null) return null;
+      if (parsed.end_line !== undefined && fullLocalToolInteger(parsed.end_line, 1, 1_000_000) === null) return null;
+      if (parsed.max_bytes !== undefined && fullLocalToolInteger(parsed.max_bytes, 1, 512 * 1024) === null) return null;
+      if (parsed.start_line !== undefined && parsed.end_line !== undefined && parsed.end_line < parsed.start_line) return null;
+      if (parsed.start_line !== undefined) request.start_line = parsed.start_line;
+      if (parsed.end_line !== undefined) request.end_line = parsed.end_line;
+      if (parsed.max_bytes !== undefined) request.max_bytes = parsed.max_bytes;
+      return request;
+    }
+    if (tool === 'search_files') {
+      request.path = fullLocalToolPath(parsed.path, true);
+      request.query = fullLocalToolString(parsed.query, FULL_LOCAL_TOOL_MAX_QUERY_LENGTH);
+      if (request.path === null || request.query === null) return null;
+      if (parsed.include !== undefined && fullLocalToolString(parsed.include, 200) === null) return null;
+      if (parsed.exclude !== undefined && (!Array.isArray(parsed.exclude) || parsed.exclude.length > 50 || parsed.exclude.some((item) => fullLocalToolString(item, 100) === null))) return null;
+      if (parsed.case_sensitive !== undefined && typeof parsed.case_sensitive !== 'boolean') return null;
+      if (parsed.regex !== undefined && typeof parsed.regex !== 'boolean') return null;
+      if (parsed.max_results !== undefined && fullLocalToolInteger(parsed.max_results, 1, 500) === null) return null;
+      if (parsed.include !== undefined) request.include = parsed.include;
+      if (parsed.exclude !== undefined) request.exclude = parsed.exclude;
+      if (parsed.case_sensitive !== undefined) request.case_sensitive = parsed.case_sensitive;
+      if (parsed.regex !== undefined) request.regex = parsed.regex;
+      if (parsed.max_results !== undefined) request.max_results = parsed.max_results;
+      return request;
+    }
+    if (tool === 'write_file') {
+      request.path = fullLocalToolPath(parsed.path);
+      request.content = fullLocalToolString(parsed.content, FULL_LOCAL_TOOL_MAX_CONTENT_BYTES, true, true);
+      return request.path === null || request.content === null || utf8Bytes(request.content) > FULL_LOCAL_TOOL_MAX_CONTENT_BYTES ? null : request;
+    }
+    if (tool === 'apply_patch') {
+      request.patch = fullLocalToolString(parsed.patch, FULL_LOCAL_TOOL_MAX_PATCH_BYTES, false, true);
+      return request.patch === null || utf8Bytes(request.patch) > FULL_LOCAL_TOOL_MAX_PATCH_BYTES ? null : request;
+    }
+    if (tool === 'exec_command') {
+      const hasCmd = Object.prototype.hasOwnProperty.call(parsed, 'cmd');
+      const hasCmds = Object.prototype.hasOwnProperty.call(parsed, 'cmds');
+      const hasCommand = Object.prototype.hasOwnProperty.call(parsed, 'command');
+      if (Number(hasCmd) + Number(hasCmds) + Number(hasCommand) !== 1) return null;
+      if (hasCmd && fullLocalToolString(parsed.cmd, FULL_LOCAL_TOOL_MAX_COMMAND_BYTES, false, true) === null) return null;
+      if (hasCmds && (!Array.isArray(parsed.cmds) || parsed.cmds.length < 1 || parsed.cmds.length > FULL_LOCAL_TOOL_MAX_EXEC_COMMANDS || parsed.cmds.some((item) => fullLocalToolString(item, FULL_LOCAL_TOOL_MAX_COMMAND_BYTES, false, true) === null))) return null;
+      if (hasCommand && (!Array.isArray(parsed.command) || parsed.command.length < 1 || parsed.command.length > FULL_LOCAL_TOOL_MAX_EXEC_COMMANDS || parsed.command.some((item) => fullLocalToolCommandArgument(item, FULL_LOCAL_TOOL_MAX_COMMAND_BYTES) === null) || fullLocalToolCommandArgument(parsed.command[0], FULL_LOCAL_TOOL_MAX_COMMAND_BYTES)?.trim() === '')) return null;
+      const cwd = parsed.cwd === undefined ? undefined : fullLocalToolPath(parsed.cwd, true, true);
+      if (cwd === null) return null;
+      if (parsed.shell !== undefined && fullLocalToolString(parsed.shell, LOCAL_TOOL_MAX_PATH_LENGTH) === null) return null;
+      if (parsed.tty !== undefined && typeof parsed.tty !== 'boolean') return null;
+      if (parsed.login !== undefined && typeof parsed.login !== 'boolean') return null;
+      if (parsed.yield_time_ms !== undefined && fullLocalToolInteger(parsed.yield_time_ms, 0, 120_000) === null) return null;
+      if (parsed.timeout_ms !== undefined && fullLocalToolInteger(parsed.timeout_ms, 0, 300_000) === null) return null;
+      if (parsed.timeout_ms !== undefined && parsed.yield_time_ms !== undefined) return null;
+      if (parsed.max_output_tokens !== undefined && fullLocalToolInteger(parsed.max_output_tokens, 1, 10_000) === null) return null;
+      if (hasCmd) request.cmd = parsed.cmd;
+      if (hasCmds) request.cmds = parsed.cmds;
+      if (hasCommand) request.command = parsed.command;
+      if (cwd !== undefined) request.cwd = cwd;
+      if (parsed.shell !== undefined) request.shell = parsed.shell;
+      if (parsed.tty !== undefined) request.tty = parsed.tty;
+      if (parsed.login !== undefined) request.login = parsed.login;
+      if (parsed.yield_time_ms !== undefined) request.yield_time_ms = parsed.yield_time_ms;
+      if (parsed.timeout_ms !== undefined) request.timeout_ms = parsed.timeout_ms;
+      if (parsed.max_output_tokens !== undefined) request.max_output_tokens = parsed.max_output_tokens;
+      return request;
+    }
+    request.session_id = fullLocalToolInteger(parsed.session_id, 1, 2_147_483_647);
+    if (request.session_id === null) return null;
+    if (parsed.input !== undefined) request.input = fullLocalToolString(parsed.input, FULL_LOCAL_TOOL_MAX_COMMAND_BYTES, true, true);
+    if (parsed.input !== undefined && request.input === null) return null;
+    if (parsed.yield_time_ms !== undefined && fullLocalToolInteger(parsed.yield_time_ms, 0, 120_000) === null) return null;
+    if (parsed.max_output_tokens !== undefined && fullLocalToolInteger(parsed.max_output_tokens, 1, 10_000) === null) return null;
+    if (parsed.yield_time_ms !== undefined) request.yield_time_ms = parsed.yield_time_ms;
+    if (parsed.max_output_tokens !== undefined) request.max_output_tokens = parsed.max_output_tokens;
+    return request;
+  }
+
+  function extractFullLocalToolRequests(text) {
+    if (typeof text !== 'string' || text.length === 0) return [];
+    const requests = [];
+    LOCAL_TOOL_TAG.lastIndex = 0;
+    for (let match = LOCAL_TOOL_TAG.exec(text); match; match = LOCAL_TOOL_TAG.exec(text)) {
+      const before = text.slice(0, match.index);
+      if ((before.match(/```/g) || []).length % 2 === 1) continue;
+      const request = parseFullLocalToolBlock(match[1]);
+      if (request) requests.push(request);
+      else console.warn('Chat On Steroids: rejected malformed full local_tool block');
+    }
+    return requests;
+  }
+
+  function extractLocalToolRequests(text) {
+    if (typeof text !== 'string' || text.length === 0) return [];
+    const requests = [];
+    LOCAL_TOOL_TAG.lastIndex = 0;
+    for (let match = LOCAL_TOOL_TAG.exec(text); match; match = LOCAL_TOOL_TAG.exec(text)) {
+      const before = text.slice(0, match.index);
+      if ((before.match(/```/g) || []).length % 2 === 1) continue;
+      const request = parseLocalToolBlock(match[1]);
+      if (request) requests.push(request);
+      else console.warn('Chat On Steroids: rejected malformed local_tool block');
+    }
+    return requests;
+  }
+
+  function rememberLocalToolId(id) {
+    if (localToolSeen.has(id)) return false;
+    localToolSeen.add(id);
+    while (localToolSeen.size > 2000) localToolSeen.delete(localToolSeen.values().next().value);
+    return true;
+  }
+
+  function fullRelayCandidateKey(conversation, messageId) {
+    return JSON.stringify([conversation || null, messageId]);
+  }
+
+  function fullRelayCallKey(conversation, messageId, requestId) {
+    return JSON.stringify([conversation || null, messageId || null, requestId]);
+  }
+
+  function rememberFullRelayCall(conversation, messageId, requestId) {
+    const key = fullRelayCallKey(conversation, messageId, requestId);
+    if (fullRelayCallSeen.has(key)) return false;
+    fullRelayCallSeen.add(key);
+    while (fullRelayCallSeen.size > 4000) fullRelayCallSeen.delete(fullRelayCallSeen.values().next().value);
+    return true;
+  }
+
+  function latchFullRelayCandidate(message, ownerConversation, ownerEpoch, turnIndex, localTurnId) {
+    if (!message || typeof message.messageId !== 'string' || message.messageId.length === 0) return null;
+    const requests = extractFullLocalToolRequests(message.rawText);
+    if (requests.length === 0) return null;
+    const key = fullRelayCandidateKey(ownerConversation, message.messageId);
+    const existing = fullRelayCandidates.get(key);
+    if (existing) {
+      const known = new Set(existing.requests.map((request) => request.id));
+      for (const request of requests) {
+        if (known.has(request.id)) continue;
+        existing.requests.push(request);
+        known.add(request.id);
+      }
+      return existing;
+    }
+    const candidate = {
+      key,
+      conversationId: ownerConversation,
+      epoch: ownerEpoch,
+      messageId: message.messageId,
+      turnIndex,
+      localTurnId,
+      requests,
+      queued: false
+    };
+    fullRelayCandidates.set(key, candidate);
+    while (fullRelayCandidates.size > 2000) fullRelayCandidates.delete(fullRelayCandidates.keys().next().value);
+    console.info('[COS][full:candidate:latched]', {
+      conversationId: ownerConversation,
+      messageId: message.messageId,
+      turnIndex,
+      localTurnId,
+      requestIds: requests.map((request) => request.id)
+    });
+    return candidate;
+  }
+
+  function plannerResultEnvelope(result) {
+    return `<local_tool_result>\n${JSON.stringify(result)}\n</local_tool_result>`;
+  }
+
+  function plannerDocumentCurrent(item, generation) {
+    return (
+      generation === localToolGeneration &&
+      alive &&
+      conversationId === item.conversationId &&
+      epoch === item.epoch &&
+      CLF_DOM.conversationId() === item.conversationId
+    );
+  }
+
+  function fullPlannerDocumentCurrent(item, generation, stage) {
+    const routeConversation = CLF_DOM.conversationId();
+    const checks = {
+      generationMatch: generation === localToolGeneration,
+      documentAlive: alive,
+      conversationMatch: conversationId === item.conversationId,
+      epochMatch: epoch === item.epoch,
+      routeConversationMatch: routeConversation === item.conversationId
+    };
+    const reasons = [];
+    if (!checks.generationMatch) reasons.push('FULL_DROP_GENERATION_MISMATCH');
+    if (!checks.documentAlive) reasons.push('FULL_DROP_DOCUMENT_NOT_ALIVE');
+    if (!checks.conversationMatch) reasons.push('FULL_DROP_CONVERSATION_MISMATCH');
+    if (!checks.epochMatch) reasons.push('FULL_DROP_EPOCH_MISMATCH');
+    if (!checks.routeConversationMatch) reasons.push('FULL_DROP_ROUTE_CONVERSATION_MISMATCH');
+    const current = Object.values(checks).every(Boolean);
+    console.info('[COS][planner-document-current]', {
+      stage,
+      id: item.request?.id,
+      tool: item.request?.tool,
+      current,
+      conversationId: item.conversationId,
+      epoch: item.epoch,
+      routeConversation,
+      ...checks,
+      reasons
+    });
+    if (!current) {
+      console.warn('[COS][full:drop:planner-document-not-current]', {
+        id: item.request?.id,
+        tool: item.request?.tool,
+        reasons
+      });
+    }
+    return current;
+  }
+
+  async function submitPlannerResult(item, generation, full = false) {
+    const deadline = Date.now() + LOCAL_TOOL_INJECTION_WINDOW_MS;
+    while (Date.now() <= deadline) {
+      const current = full
+        ? fullPlannerDocumentCurrent(item, generation, 'before-result')
+        : plannerDocumentCurrent(item, generation);
+      if (!current) return false;
+      const busy = generating || CLF_DOM.generating() || pendingTools > 0 || nativeBusy || goalBusy || compactCapture || (job && job.busy);
+      const box = CLF_DOM.composer();
+      if (!busy && box && (box.textContent || '').trim() === '') {
+        if (!CLF_DOM.insertPrompt(plannerResultEnvelope(item.result))) return false;
+        return await CLF_DOM.send();
+      }
+      await sleep(250);
+    }
+    return false;
+  }
+
+  async function drainLocalToolQueue() {
+    if (localToolDrain) return localToolDrain;
+    const generation = localToolGeneration;
+    const work = (async () => {
+      while (localToolQueue.length > 0 && generation === localToolGeneration) {
+        const item = localToolQueue.shift();
+        if (!item || !plannerDocumentCurrent(item, generation)) continue;
+        if (!item.result) {
+          const reply = await ask({ type: 'planner_relay', ...item.request });
+          if (!plannerDocumentCurrent(item, generation)) continue;
+          item.result = reply && typeof reply.id === 'string' && reply.id === item.request.id && reply.tool === item.request.tool && typeof reply.ok === 'boolean'
+            ? reply
+            : { id: item.request.id, tool: item.request.tool, ok: false, error: reply?.error || 'planner_relay_failed' };
+        }
+        const sent = await submitPlannerResult(item, generation);
+        if (!sent) {
+          observed.lastError = 'planner_result_not_sent';
+          console.warn(`Chat On Steroids: planner result ${item.request.id} was not submitted`);
+        }
+      }
+    })();
+    const tracked = work.finally(() => {
+      if (localToolDrain === tracked) localToolDrain = null;
+    });
+    localToolDrain = tracked;
+    return tracked;
+  }
+
+  function queueLocalToolRequests(text, ownerConversation, ownerEpoch) {
+    const requests = extractLocalToolRequests(text);
+    for (const request of requests) {
+      if (!rememberLocalToolId(request.id)) {
+        console.info(`Chat On Steroids: duplicate planner request ignored: ${request.id}`);
+        continue;
+      }
+      localToolOperations += 1;
+      if (localToolOperations > LOCAL_TOOL_MAX_OPERATIONS) {
+        localToolQueue.push({
+          request,
+          result: { id: request.id, tool: request.tool, ok: false, error: 'planner_operation_limit' },
+          conversationId: ownerConversation,
+          epoch: ownerEpoch
+        });
+        continue;
+      }
+      localToolQueue.push({ request, result: null, conversationId: ownerConversation, epoch: ownerEpoch });
+    }
+    if (requests.length > 0) void drainLocalToolQueue();
+  }
+
+  async function drainFullLocalToolQueue() {
+    if (fullLocalToolDrain) {
+      console.info('[COS][queue:wakeup]', { running: true, queueSize: fullLocalToolQueue.length });
+      return fullLocalToolDrain;
+    }
+    console.info('[COS][queue:wakeup]', { running: false, queueSize: fullLocalToolQueue.length });
+    const generation = localToolGeneration;
+    const work = (async () => {
+      while (fullLocalToolQueue.length > 0 && generation === localToolGeneration) {
+        const item = fullLocalToolQueue.shift();
+        if (!item) continue;
+        console.info('[COS][queue:dequeue]', {
+          id: item.request.id,
+          mode: item.request.mode,
+          tool: item.request.tool,
+          path: item.request.path,
+          queueSize: fullLocalToolQueue.length
+        });
+        if (!fullPlannerDocumentCurrent(item, generation, 'before-relay')) continue;
+        if (!item.result) {
+          console.info('[COS][dispatch:start]', { id: item.request.id, mode: 'full', tool: item.request.tool });
+          const reply = await ask({ type: 'full_relay', ...item.request });
+          if (!fullPlannerDocumentCurrent(item, generation, 'after-relay')) continue;
+          item.result = reply && typeof reply.id === 'string' && reply.id === item.request.id && reply.mode === 'full' && reply.tool === item.request.tool && typeof reply.ok === 'boolean'
+            ? reply
+            : { id: item.request.id, mode: 'full', tool: item.request.tool, ok: false, error: reply?.error || 'full_relay_failed' };
+        }
+        console.info('[COS][result:inject]', { id: item.request.id, mode: 'full', tool: item.request.tool, ok: item.result.ok });
+        const sent = await submitPlannerResult(item, generation, true);
+        console.info('[COS][result:inject:sent]', { id: item.request.id, mode: 'full', tool: item.request.tool, sent });
+        if (!sent) {
+          observed.lastError = 'full_result_not_sent';
+          console.warn(`Chat On Steroids: full result ${item.request.id} was not submitted`);
+        }
+      }
+    })();
+    const tracked = work.finally(() => {
+      if (fullLocalToolDrain === tracked) fullLocalToolDrain = null;
+    });
+    fullLocalToolDrain = tracked;
+    return tracked;
+  }
+
+  function queueParsedFullLocalToolRequests(requests, ownerConversation, ownerEpoch, messageId = null) {
+    let queued = 0;
+    for (const request of requests) {
+      if (!rememberFullRelayCall(ownerConversation, messageId, request.id)) {
+        console.debug('[COS][full:duplicate:skip]', {
+          id: request.id,
+          conversationId: ownerConversation,
+          messageId
+        });
+        continue;
+      }
+      fullLocalToolOperations += 1;
+      queued += 1;
+      console.info('[COS][queue:enqueue]', {
+        id: request.id,
+        mode: request.mode,
+        tool: request.tool,
+        path: request.path,
+        queueSize: fullLocalToolQueue.length + 1,
+        operationLimit: fullLocalToolOperations > LOCAL_TOOL_MAX_OPERATIONS
+      });
+      if (fullLocalToolOperations > LOCAL_TOOL_MAX_OPERATIONS) {
+        fullLocalToolQueue.push({
+          request,
+          result: { id: request.id, mode: 'full', tool: request.tool, ok: false, error: 'full_operation_limit' },
+          conversationId: ownerConversation,
+          epoch: ownerEpoch
+        });
+        continue;
+      }
+      fullLocalToolQueue.push({ request, result: null, conversationId: ownerConversation, epoch: ownerEpoch });
+    }
+    if (queued > 0) void drainFullLocalToolQueue();
+    return queued;
+  }
+
+  function queueFullLocalToolRequests(text, ownerConversation, ownerEpoch, messageId = null) {
+    return queueParsedFullLocalToolRequests(extractFullLocalToolRequests(text), ownerConversation, ownerEpoch, messageId);
+  }
+
+  function resumeFullRelayCandidate(candidate) {
+    if (!candidate || candidate.queued) return 0;
+    candidate.queued = true;
+    console.info('[COS][full:candidate:resume]', {
+      conversationId: candidate.conversationId,
+      messageId: candidate.messageId,
+      turnIndex: candidate.turnIndex,
+      localTurnId: candidate.localTurnId,
+      requestIds: candidate.requests.map((request) => request.id)
+    });
+    return queueParsedFullLocalToolRequests(
+      candidate.requests,
+      candidate.conversationId,
+      candidate.epoch,
+      candidate.messageId
+    );
+  }
 
   const entryBytes = (entry) => {
     try {
@@ -1098,6 +1602,16 @@
     entries = [];
     streamEntries = [];
     streamRequestTurnOwners.clear();
+    localToolQueue.length = 0;
+    fullLocalToolQueue.length = 0;
+    fullRelayCandidates.clear();
+    fullRelayCallSeen.clear();
+    localToolSeen.clear();
+    localToolOperations = 0;
+    fullLocalToolOperations = 0;
+    localToolGeneration += 1;
+    localToolDrain = null;
+    fullLocalToolDrain = null;
     since = 0;
     job = null;
     pendingTools = 0;
@@ -3077,6 +3591,71 @@
           state,
           final: state === 'final'
         });
+        if (state === 'final') {
+          console.info('[COS][fiber:final-detected]', {
+            messageId: message.messageId,
+            index,
+            activeTurnIndex,
+            localOwner,
+            activeLocalTurnId,
+            askedConversation,
+            conversationId
+          });
+          const fullRelayGate = {
+            stateFinal: true,
+            notGenerating: !generating,
+            activeIndexMatch: index === activeTurnIndex,
+            localOwnerPresent: Boolean(localOwner),
+            localOwnerMatch: localOwner === activeLocalTurnId,
+            conversationMatch: askedConversation === conversationId
+          };
+          const ownershipGate = {
+            stateFinal: fullRelayGate.stateFinal,
+            activeIndexMatch: fullRelayGate.activeIndexMatch,
+            localOwnerPresent: fullRelayGate.localOwnerPresent,
+            localOwnerMatch: fullRelayGate.localOwnerMatch,
+            conversationMatch: fullRelayGate.conversationMatch
+          };
+          const ownedFinal = Object.values(ownershipGate).every(Boolean);
+          console.info('[COS][full:auto-gate]', {
+            ...fullRelayGate,
+            state,
+            generating,
+            index,
+            activeTurnIndex,
+            localOwner,
+            activeLocalTurnId,
+            askedConversation,
+            conversationId
+          });
+          const candidateKey = fullRelayCandidateKey(askedConversation, message.messageId);
+          let candidate = fullRelayCandidates.get(candidateKey) || null;
+          if (ownedFinal) {
+            candidate = latchFullRelayCandidate(message, askedConversation, askedEpoch, index, localOwner);
+            // Planner Relay retains its original completion gate. Full Relay is the only
+            // path that latches ownership across the generation boundary below.
+            if (!generating) queueLocalToolRequests(message.rawText, askedConversation, askedEpoch);
+          }
+          const candidateConversationMatch = candidate && candidate.conversationId === askedConversation;
+          const candidateEpochMatch = candidate && candidate.epoch === askedEpoch;
+          if (candidate && !generating && candidateConversationMatch && candidateEpochMatch) {
+            resumeFullRelayCandidate(candidate);
+          } else if (candidate && generating) {
+            console.info('[COS][full:waiting-generation]', {
+              conversationId: candidate.conversationId,
+              messageId: candidate.messageId,
+              requestIds: candidate.requests.map((request) => request.id)
+            });
+          } else if (!ownedFinal) {
+            const reasons = [];
+            if (!ownershipGate.activeIndexMatch) reasons.push('FULL_DROP_TURN_INDEX_MISMATCH');
+            if (!ownershipGate.localOwnerPresent) reasons.push('FULL_DROP_LOCAL_OWNER_MISSING');
+            if (!ownershipGate.localOwnerMatch) reasons.push('FULL_DROP_LOCAL_OWNER_MISMATCH');
+            if (!ownershipGate.conversationMatch) reasons.push('FULL_DROP_CONVERSATION_MISMATCH');
+            if (candidate && !candidateEpochMatch) reasons.push('FULL_DROP_CANDIDATE_EPOCH_MISMATCH');
+            console.warn('[COS][full:auto-gate:blocked]', { ...fullRelayGate, reasons });
+          }
+        }
       }
     }
     // ChatGPT's own message model is stronger completion evidence than the renderer's Stop
@@ -8654,6 +9233,16 @@
       injectControl,
       injectStage,
       pullActivity,
+      parseLocalToolBlock,
+      extractLocalToolRequests,
+      plannerResultEnvelope,
+      queueLocalToolRequests,
+      parseFullLocalToolBlock,
+      extractFullLocalToolRequests,
+      queueFullLocalToolRequests,
+      drainFullLocalToolQueue,
+      plannerRelayState: () => ({ conversationId, epoch }),
+      drainLocalToolQueue,
       runCommand,
       startCompact,
       refreshFiber,

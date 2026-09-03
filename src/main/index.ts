@@ -57,6 +57,7 @@ import {
 } from './window-lifecycle.js';
 import { trayGuidArgsForPlatform, trayImageSpec } from './tray-image.js';
 import { browserWindowIconPath } from './window-icon.js';
+import { shutdownPlannerServer, startPlannerServer } from './planner/codex-mhj_26_09_02_05_server.js';
 
 /** Durable state file holding the multi-agent run. Hashes only, never credentials. */
 const SWARM_STATE = 'swarm';
@@ -226,6 +227,11 @@ void app.whenReady().then(async () => {
   initDurableStore(userData);
   await loadConfig();
   if (windowActivation.isDisabled()) return;
+
+  // Start the local Planner Bridge as soon as configuration is available. The remaining startup
+  // recovery is intentionally allowed to continue without making the WebMCP page race the server.
+  void startPlannerServer();
+
   // The renderer has its own explicit light/dark palette, so native chrome must follow the same
   // user choice instead of Electron's default `system` theme. On macOS this controls the window
   // frame, application menus and OS dialogs; on Linux/Windows it covers Electron-native UI.
@@ -338,10 +344,11 @@ void app.whenReady().then(async () => {
   // traffic, so never make startup/reload wait behind years of old session history.
   queueDeterministicAttributionRepair();
 
-  // The bridge serves recording and multi-agent mode both: recording needs the
-  // extension to observe the chat, and multi-agent mode needs it to open worker tabs.
-  // Either switch being on starts it. ipc.ts applies the same rule on a settings save.
-  if (getConfig().sessions.record || getConfig().multiAgent.enabled) {
+  // The bridge serves recording, multi-agent mode and the browser Full Relay: recording needs
+  // the extension to observe the chat, multi-agent mode needs it to open worker tabs, and Full
+  // Relay needs its authenticated request path. Either switch being on starts it. ipc.ts
+  // applies the same rule on a settings save.
+  if (getConfig().sessions.record || getConfig().multiAgent.enabled || getConfig().fullRelay.enabled) {
     void startBridge();
   }
   // Retention governs recordings already stored on disk, independent of whether recording is
@@ -393,7 +400,7 @@ app.on('will-quit', (event) => {
       // The budget has to clear the drains it contains, or it would silently defeat them:
       // the bridge force-closes wedged localhost sockets at 15s and the MCP endpoint forces
       // its own drain at 30s. This is the outer bound on both, not a competing one.
-      { name: 'admission/drain', budgetMs: 40_000, run: () => [shutdownConnection(), shutdownBridge()] },
+      { name: 'admission/drain', budgetMs: 40_000, run: () => [shutdownConnection(), shutdownBridge(), shutdownPlannerServer()] },
       // Phase 2: only after request handlers are done may their owned child processes go.
       {
         name: 'process cleanup',

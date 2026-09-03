@@ -30,6 +30,8 @@ export interface SettingsPatch {
   sessions: Config['sessions'];
   compaction: Config['compaction'];
   multiAgent: Config['multiAgent'];
+  /** Optional for compatibility with renderer callers from before Full Relay was added. */
+  fullRelay?: Config['fullRelay'];
   goal: Config['goal'];
 }
 
