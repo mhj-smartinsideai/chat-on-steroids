@@ -69,6 +69,21 @@ function materializedFingerprint(dir: string): string | null {
   }
 }
 
+/**
+ * Chrome can keep the stable unpacked-extension directory open while it is running. If that
+ * prevents the directory rename below, update the already-loaded path only after the complete
+ * staged tree exists. The marker is written last by the stage, so a failed copy remains visibly
+ * stale and will be retried on the next app start instead of being mistaken for a full refresh.
+ */
+function copyStagedExtensionInPlace(stage: string, stable: string, fingerprint: string): boolean {
+  try {
+    cpSync(stage, stable, { recursive: true, force: true });
+    return validExtension(stable) && materializedFingerprint(stable) === fingerprint;
+  } catch {
+    return false;
+  }
+}
+
 function recoverInterruptedMaterialization(stable: string, stage: string, backup: string): void {
   if (validExtension(stable)) return;
 
@@ -142,6 +157,13 @@ function materializePackagedExtension(bundled: string, stable: string): string |
     if (oldMoved) rmSync(backup, { recursive: true, force: true });
     return stable;
   } catch {
+    // On Windows Chrome may hold the unpacked folder strongly enough that the atomic directory
+    // rename is refused. Keep the Chrome-visible pathname and copy the already-validated stage
+    // over it as a bounded fallback; a later launch retries if this fallback cannot complete.
+    if (!oldMoved && validExtension(stable) && validExtension(stage) && copyStagedExtensionInPlace(stage, stable, fingerprint)) {
+      rmSync(stage, { recursive: true, force: true });
+      return stable;
+    }
     // If rollback succeeded, the stale/partial stage is disposable. If no published copy exists,
     // preserve a completed stage or backup for the next startup's recovery instead of deleting
     // the only remaining recoverable material.

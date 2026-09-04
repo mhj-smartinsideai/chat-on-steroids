@@ -101,6 +101,53 @@ it('repairs a stale destination shape with a complete staged extension instead o
   await expect(fs.access(`${stable}.old`)).rejects.toBeDefined();
 });
 
+it('refreshes the stable folder in place when Chrome prevents its directory rename', async () => {
+  base = await makeTempDir('clf-extension-open-folder-');
+  const resources = path.join(base, 'resources');
+  const bundled = path.join(resources, 'extension');
+  const userData = path.join(base, 'user-data');
+  const stable = path.join(userData, 'extension');
+  await fs.mkdir(path.join(bundled, 'icons'), { recursive: true });
+  await fs.writeFile(path.join(bundled, 'manifest.json'), JSON.stringify({ version: '2.0.2' }));
+  await fs.writeFile(path.join(bundled, 'background.js'), 'new background');
+  await fs.writeFile(path.join(bundled, 'icons', 'icon128.png'), 'new icon');
+  await fs.mkdir(path.join(stable, 'icons'), { recursive: true });
+  await fs.writeFile(path.join(stable, 'manifest.json'), JSON.stringify({ version: '2.0.2' }));
+  await fs.writeFile(path.join(stable, 'background.js'), 'old background');
+  await fs.writeFile(path.join(stable, 'icons', 'icon128.png'), 'old icon');
+  await fs.writeFile(path.join(stable, '.chat-on-steroids-source'), 'stale fingerprint');
+
+  Object.defineProperty(process, 'resourcesPath', {
+    configurable: true,
+    writable: true,
+    value: resources
+  });
+  vi.doMock('electron', () => ({
+    app: {
+      isPackaged: true,
+      getPath: (name: string) => (name === 'userData' ? userData : ''),
+      getAppPath: () => path.join(base!, 'not-used')
+    }
+  }));
+  vi.doMock('node:fs', async () => {
+    const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
+    return {
+      ...actual,
+      renameSync: (from: string, to: string) => {
+        if (from === stable) throw new Error('simulated Chrome folder lock');
+        return actual.renameSync(from, to);
+      }
+    };
+  });
+
+  const { extensionDir } = await import('../src/main/extension-path.js');
+  expect(extensionDir()).toBe(stable);
+  expect(await fs.readFile(path.join(stable, 'background.js'), 'utf8')).toBe('new background');
+  expect(await fs.readFile(path.join(stable, 'icons', 'icon128.png'), 'utf8')).toBe('new icon');
+  expect(await fs.readFile(path.join(stable, '.chat-on-steroids-source'), 'utf8')).not.toBe('stale fingerprint');
+  await expect(fs.access(`${stable}.new`)).rejects.toBeDefined();
+});
+
 it('recovers an interrupted promotion from the valid old copy before trusting stale new or package data', async () => {
   base = await makeTempDir('clf-extension-crash-recovery-');
   const resources = path.join(base, 'resources');
@@ -143,4 +190,12 @@ it('recovers an interrupted promotion from the valid old copy before trusting st
   expect(JSON.parse(await fs.readFile(path.join(stable, 'manifest.json'), 'utf8'))).toEqual({ version: '1.9.9' });
   await expect(fs.access(backup)).rejects.toBeDefined();
   await expect(fs.access(stage)).rejects.toBeDefined();
+});
+
+it('prepares the packaged extension before the bridge starts accepting browser traffic', async () => {
+  const source = await fs.readFile(path.join(process.cwd(), 'src', 'main', 'index.ts'), 'utf8');
+  const refresh = source.indexOf('const packagedExtension = extensionDir();');
+  const bridge = source.indexOf('void startBridge();');
+  expect(refresh).toBeGreaterThanOrEqual(0);
+  expect(bridge).toBeGreaterThan(refresh);
 });

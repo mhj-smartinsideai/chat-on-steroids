@@ -58,6 +58,7 @@ import {
 import { trayGuidArgsForPlatform, trayImageSpec } from './tray-image.js';
 import { browserWindowIconPath } from './window-icon.js';
 import { shutdownPlannerServer, startPlannerServer } from './planner/codex-mhj_26_09_02_05_server.js';
+import { extensionDir } from './extension-path.js';
 
 /** Durable state file holding the multi-agent run. Hashes only, never credentials. */
 const SWARM_STATE = 'swarm';
@@ -227,6 +228,14 @@ void app.whenReady().then(async () => {
   initDurableStore(userData);
   await loadConfig();
   if (windowActivation.isDisabled()) return;
+
+  // Chrome keeps the unpacked extension at this stable userData path across app updates.
+  // Refresh it before the bridge can receive browser traffic; otherwise a newly installed
+  // app can meet the previous extension generation and report a protocol mismatch forever.
+  const packagedExtension = extensionDir();
+  if (app.isPackaged && !packagedExtension) {
+    logWarn('the bundled Chrome extension is unavailable; the extension folder cannot be refreshed');
+  }
 
   // Start the local Planner Bridge as soon as configuration is available. The remaining startup
   // recovery is intentionally allowed to continue without making the WebMCP page race the server.
